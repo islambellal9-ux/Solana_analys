@@ -576,12 +576,16 @@ def compute_score(security: dict, holders: dict, momentum: dict, dev: dict) -> d
 # ------------------------------------------------------------------------- #
 
 def compute_scalp_plan(price: Optional[float], recent_low: Optional[float],
-                        liq_usd: Optional[float]) -> Optional[dict]:
+                        liq_usd: Optional[float], mcap: Optional[float] = None) -> Optional[dict]:
     """يبني خطة سكالبينغ كاملة حول "منطقة دعم" محسوبة.
 
     منطقة الدعم = قاع سعري حقيقي من آخر 48 ساعة (GeckoTerminal OHLCV) إذا
     توفر، وإلا تقدير تقريبي (-10% من السعر الحالي) كحل احتياطي معلن بوضوح
     في التقرير. هذا حساب رياضي بسيط على بيانات حقيقية، وليس توصية مضمونة.
+
+    إذا توفر mcap الحالي، نحسب "معامل التحويل" (Market Cap ÷ Price = العرض
+    المتداول الفعلي) ونستعمله لتحويل كل مستوى سعري لمستوى ماركت كاب مكافئ،
+    لأن أغلب متداولي الميم كوين يتابعون الماركت كاب مباشرة لا السعر الكسري.
     """
     if not price or price <= 0:
         return None
@@ -609,12 +613,27 @@ def compute_scalp_plan(price: Optional[float], recent_low: Optional[float],
     if liq_usd is not None and liq_usd < 15_000:
         liq_note = "⚠️ السيولة منخفضة: انزلاق السعر (Slippage) قد يبعدك عن هذه المستويات بالضبط."
 
+    # تحويل لماركت كاب: نفترض عرض متداول ثابت (صحيح طالما Mint Authority ملغاة)
+    supply = None
+    if mcap and price and price > 0:
+        try:
+            supply = float(mcap) / price
+        except (TypeError, ValueError, ZeroDivisionError):
+            supply = None
+
+    def to_mcap(p):
+        return p * supply if supply else None
+
     return {
         "entry_low": entry_low, "entry_high": entry_high,
         "stop_loss": stop_loss,
         "tp1_low": tp1_low, "tp1_high": tp1_high,
         "tp2_low": tp2_low, "tp2_high": tp2_high,
         "rr": rr, "estimated": estimated, "liq_note": liq_note,
+        "mcap_entry_low": to_mcap(entry_low), "mcap_entry_high": to_mcap(entry_high),
+        "mcap_stop_loss": to_mcap(stop_loss),
+        "mcap_tp1_low": to_mcap(tp1_low), "mcap_tp1_high": to_mcap(tp1_high),
+        "mcap_tp2_low": to_mcap(tp2_low), "mcap_tp2_high": to_mcap(tp2_high),
     }
 
 
@@ -645,12 +664,20 @@ def build_scalp_section(rating: dict, scalp: Optional[dict]) -> str:
 
     est_tag = " _(تقدير تقريبي، ما كانش قاع سعري مؤكد)_" if scalp["estimated"] else " _(مبني على قاع سعري فعلي 48 ساعة)_"
     rr_line = f"1:{scalp['rr']:.1f}" if scalp["rr"] else NA
+
+    def level(label_price, label_mcap_prefix, lo, hi, mlo, mhi, suffix=""):
+        price_part = f"{fmt_price(lo)} — {fmt_price(hi)}{suffix}"
+        if mlo is not None and mhi is not None:
+            price_part += f"\n   💠 بالماركت كاب: {fmt_usd(mlo)} — {fmt_usd(mhi)}"
+        return price_part
+
     lines = [
         "⚡ *خطة السكالبينغ والتداول (Scalp Setup):*",
-        f"🎯 *منطقة الدخول:* {fmt_price(scalp['entry_low'])} — {fmt_price(scalp['entry_high'])}{est_tag}",
-        f"🚀 *الهدف الأول (TP1):* {fmt_price(scalp['tp1_low'])} — {fmt_price(scalp['tp1_high'])} (+15% إلى +20%)",
-        f"🚀 *الهدف الثاني (TP2):* {fmt_price(scalp['tp2_low'])} — {fmt_price(scalp['tp2_high'])} (+35% إلى +50%)",
-        f"🛑 *وقف الخسارة:* {fmt_price(scalp['stop_loss'])} (تحت الدعم بـ4%)",
+        f"🎯 *منطقة الدخول:* {level(None, None, scalp['entry_low'], scalp['entry_high'], scalp['mcap_entry_low'], scalp['mcap_entry_high'], est_tag)}",
+        f"🚀 *الهدف الأول (TP1) +15% إلى +20%:* {level(None, None, scalp['tp1_low'], scalp['tp1_high'], scalp['mcap_tp1_low'], scalp['mcap_tp1_high'])}",
+        f"🚀 *الهدف الثاني (TP2) +35% إلى +50%:* {level(None, None, scalp['tp2_low'], scalp['tp2_high'], scalp['mcap_tp2_low'], scalp['mcap_tp2_high'])}",
+        f"🛑 *وقف الخسارة (تحت الدعم بـ4%):* {fmt_price(scalp['stop_loss'])}"
+        + (f"\n   💠 بالماركت كاب: {fmt_usd(scalp['mcap_stop_loss'])}" if scalp['mcap_stop_loss'] is not None else ""),
         f"⚖️ *نسبة المخاطرة/العائد:* {rr_line}",
     ]
     if scalp["liq_note"]:
@@ -763,7 +790,7 @@ async def analyze_mint(address: str) -> str:
         scalp = None
         if rating["total"] >= SCALP_MIN_SCORE and momentum["price"]:
             recent_low = await fetch_recent_low(session, momentum.get("pair_address"))
-            scalp = compute_scalp_plan(momentum["price"], recent_low, momentum["liq_usd"])
+            scalp = compute_scalp_plan(momentum["price"], recent_low, momentum["liq_usd"], momentum.get("mcap"))
 
     if used_fallback:
         log.info("Used GeckoTerminal fallback for %s", address)
