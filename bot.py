@@ -161,6 +161,21 @@ def fmt_pct(n: Optional[float], signed: bool = False) -> str:
     return f"{sign}{n:.1f}%"
 
 
+def to_float(x: Any) -> Optional[float]:
+    """تحويل آمن لأي قيمة رقمية قادمة من API خارجي.
+
+    مهم جداً لـ GeckoTerminal تحديداً: يرجّع أغلب حقوله الرقمية كـ *نصوص*
+    (مثلاً "45203.12" بدل 45203.12) حسب مواصفة JSON:API اللي يتبعها، وأي
+    عملية حسابية أو مقارنة مباشرة على نص كهذا تطيح البوت بخطأ TypeError.
+    """
+    if x is None:
+        return None
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
 def age_from_ms(ms: Optional[int]) -> str:
     if not ms:
         return NA
@@ -358,7 +373,7 @@ def analyze_dev(rug: dict, pump: Optional[dict]) -> dict:
             None,
         )
         if match:
-            dev_pct = safe_get(match, "pct", default=None)
+            dev_pct = to_float(safe_get(match, "pct", default=None))
             dev_sold = False
         else:
             # المطوّر ظهر كـ creator لكن ما عادش ضمن كبار الحاملين = غالباً باع
@@ -452,22 +467,20 @@ def analyze_momentum(dex: Optional[dict]) -> dict:
             "buys_5m": None, "sells_5m": None, "change_5m": None, "change_1h": None,
             "price": None, "pair_age_ms": None, "pair_address": None,
         }
-    price = safe_get(dex, "priceUsd", default=None)
-    try:
-        price = float(price) if price is not None else None
-    except (TypeError, ValueError):
-        price = None
+    buys_5m = to_float(safe_get(dex, "txns", "m5", "buys", default=None))
+    sells_5m = to_float(safe_get(dex, "txns", "m5", "sells", default=None))
     return {
-        "vol_5m": safe_get(dex, "volume", "m5", default=None),
-        "vol_1h": safe_get(dex, "volume", "h1", default=None),
-        "liq_usd": safe_get(dex, "liquidity", "usd", default=None),
-        "mcap": safe_get(dex, "marketCap", default=None) or safe_get(dex, "fdv", default=None),
-        "buys_5m": safe_get(dex, "txns", "m5", "buys", default=None),
-        "sells_5m": safe_get(dex, "txns", "m5", "sells", default=None),
-        "change_5m": safe_get(dex, "priceChange", "m5", default=None),
-        "change_1h": safe_get(dex, "priceChange", "h1", default=None),
-        "price": price,
-        "pair_age_ms": safe_get(dex, "pairCreatedAt", default=None),
+        "vol_5m": to_float(safe_get(dex, "volume", "m5", default=None)),
+        "vol_1h": to_float(safe_get(dex, "volume", "h1", default=None)),
+        "liq_usd": to_float(safe_get(dex, "liquidity", "usd", default=None)),
+        "mcap": to_float(safe_get(dex, "marketCap", default=None)) or to_float(safe_get(dex, "fdv", default=None)),
+        # نحافظ على القيم الصحيحة (int) لعدد العمليات بدل float لعرض أجمل (40 لا 40.0)
+        "buys_5m": int(buys_5m) if buys_5m is not None else None,
+        "sells_5m": int(sells_5m) if sells_5m is not None else None,
+        "change_5m": to_float(safe_get(dex, "priceChange", "m5", default=None)),
+        "change_1h": to_float(safe_get(dex, "priceChange", "h1", default=None)),
+        "price": to_float(safe_get(dex, "priceUsd", default=None)),
+        "pair_age_ms": to_float(safe_get(dex, "pairCreatedAt", default=None)),
         "pair_address": safe_get(dex, "pairAddress", default=None),
     }
 
