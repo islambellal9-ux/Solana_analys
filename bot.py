@@ -557,24 +557,35 @@ def analyze_momentum(dex: Optional[dict]) -> dict:
 # ------------------------------------------------------------------------- #
 
 def compute_score(security: dict, holders: dict, momentum: dict, dev: dict) -> dict:
+    """يحسب تقييماً من 100 + قائمة أسباب مرتبة حسب الخطورة الفعلية.
+
+    ثغرة حقيقية انصلحت هنا: الأسباب قبل كانت تترتب حسب ترتيب الفحوصات في
+    الكود (أمان ثم توزيع ثم حجم...)، مو حسب أهمية الخطر الفعلي. شفنا عملياً
+    عملة تنهار -65% خلال 5 دقائق لكن "السبب الرئيسي" المعروض كان عن نسبة
+    قفل سيولة بسيطة، لأنه فحص الأمان ينفّذ أولاً في الكود. دابا كل سبب له
+    أولوية (severity)، والأسباب تترتب تنازلياً قبل اختيار "السبب الرئيسي".
+    """
     score = 0.0
-    reasons = []
+    reasons = []  # كل عنصر: (severity, text) — severity أعلى = أخطر = يظهر أول
+
+    def add_reason(severity: int, text: str) -> None:
+        reasons.append((severity, text))
 
     # 1) الأمان: 40 نقطة
     sec_pts = 0.0
     if security["mint_disabled"] is True:
         sec_pts += 12
     elif security["mint_disabled"] is False:
-        reasons.append("صلاحية السك مفعّلة (خطر تضخيم العرض)")
+        add_reason(95, "صلاحية السك مفعّلة (خطر تضخيم العرض)")
     if security["freeze_disabled"] is True:
         sec_pts += 12
     elif security["freeze_disabled"] is False:
-        reasons.append("صلاحية التجميد مفعّلة (خطر منع البيع)")
+        add_reason(95, "صلاحية التجميد مفعّلة (خطر منع البيع)")
     lp = security["lp_locked_pct"]
     if lp is not None:
         sec_pts += min(16, (lp / 100) * 16)
         if lp < 50:
-            reasons.append("نسبة قفل/حرق السيولة منخفضة")
+            add_reason(20, "نسبة قفل/حرق السيولة منخفضة")
     score += sec_pts
 
     # 2) توزيع الحاملين: 25 نقطة
@@ -592,18 +603,18 @@ def compute_score(security: dict, holders: dict, momentum: dict, dev: dict) -> d
         elif t10 <= 35:
             dist_pts += 2
             concentration_danger = True
-            reasons.append(f"تركيز خطير في أكبر 10 محافظ ({t10:.1f}%، فوق حد الأمان {TOP10_DANGER_PCT}%)")
+            add_reason(90, f"تركيز خطير في أكبر 10 محافظ ({t10:.1f}%، فوق حد الأمان {TOP10_DANGER_PCT}%)")
         else:
             concentration_danger = True
-            reasons.append(f"تجميع خطير جداً في أكبر 10 محافظ ({t10:.1f}%)")
+            add_reason(98, f"تجميع خطير جداً في أكبر 10 محافظ ({t10:.1f}%)")
     if holders["bundled"] is False:
         dist_pts += 7
     elif holders["bundled"] is True:
-        reasons.append("رُصد نمط قنص/حزمة شراء بالبلوك الأول")
+        add_reason(90, "رُصد نمط قنص/حزمة شراء بالبلوك الأول")
     if dev.get("dev_sold") is True:
         dist_pts += 0  # المطور باع: لا عقوبة إضافية هنا (أحياناً إيجابي)، لكن ينذكر في التقرير
     elif dev.get("dev_sold") is False and (dev.get("dev_pct") or 0) > 15:
-        reasons.append("المطوّر لا يزال يملك نسبة كبيرة من العرض")
+        add_reason(50, "المطوّر لا يزال يملك نسبة كبيرة من العرض")
     score += dist_pts
 
     # 3) الحجم ونسبة الشراء/البيع: 20 نقطة
@@ -616,19 +627,19 @@ def compute_score(security: dict, holders: dict, momentum: dict, dev: dict) -> d
         if 0.05 <= ratio <= 3:
             vol_pts += 10
         elif ratio > 3:
-            reasons.append("حجم التداول ضخم جداً مقابل السيولة (قد يكون مصطنعاً)")
+            add_reason(30, "حجم التداول ضخم جداً مقابل السيولة (قد يكون مصطنعاً)")
     if buys is not None and sells is not None:
-        total = buys + sells
-        if total >= 20:
+        total_tx = buys + sells
+        if total_tx >= 20:
             bratio = buys / max(sells, 1)
             if bratio >= 1.2:
                 vol_pts += 10
             elif bratio >= 0.8:
                 vol_pts += 5
             else:
-                reasons.append("البيع يفوق الشراء في آخر 5 دقائق")
+                add_reason(35, "البيع يفوق الشراء في آخر 5 دقائق")
         else:
-            reasons.append("عدد صفقات قليل جداً آخر 5 دقائق")
+            add_reason(15, "عدد صفقات قليل جداً آخر 5 دقائق")
     score += vol_pts
 
     # 4) كفاية السيولة: 15 نقطة
@@ -640,9 +651,9 @@ def compute_score(security: dict, holders: dict, momentum: dict, dev: dict) -> d
             liq_pts += 9
         elif liq >= 5_000:
             liq_pts += 4
-            reasons.append("سيولة منخفضة، انزلاق سعري متوقع")
+            add_reason(40, "سيولة منخفضة، انزلاق سعري متوقع")
         else:
-            reasons.append("سيولة ضعيفة جداً، خطر مرتفع")
+            add_reason(60, "سيولة ضعيفة جداً، خطر مرتفع")
     score += liq_pts
 
     # 5) تأكيد الاتجاه (Trend Confirmation): عقوبة صريحة إذا السعر فعلاً هابط
@@ -651,17 +662,26 @@ def compute_score(security: dict, holders: dict, momentum: dict, dev: dict) -> d
     # وبلا هذا الفحص كانت تاخذ تقييم عالي رغم إنها فعلياً "تروقة" سعرية جارية.
     change_1h = momentum.get("change_1h")
     change_5m = momentum.get("change_5m")
+    crashing_now = False
     if change_1h is not None:
         if change_1h <= -25:
             score -= 15
-            reasons.append("هبوط حاد جداً آخر ساعة، الموجة غالباً انتهت أو العملة تنهار")
+            crashing_now = True
+            add_reason(85, "هبوط حاد جداً آخر ساعة، الموجة غالباً انتهت أو العملة تنهار")
         elif change_1h <= -10:
             score -= 7
-            reasons.append("ضعف واضح في السعر آخر ساعة")
-    if change_5m is not None and change_1h is not None and change_1h > 0 and change_5m <= -8:
-        # الاتجاه العام صاعد لكن آخر 5 دقايق فيها انعكاس بيع قوي = إشارة خروج مبكرة
-        score -= 5
-        reasons.append("انعكاس بيع قصير المدى رغم الاتجاه الصاعد العام")
+            add_reason(45, "ضعف واضح في السعر آخر ساعة")
+    # انهيار فوري خلال آخر 5 دقائق فقط - أخطر إشارة ممكنة لأنها تعني العملة
+    # تنهار الآن بالضبط، وقت التقرير نفسه، مو موجة ضعف تدريجية.
+    if change_5m is not None:
+        if change_5m <= -30:
+            score -= 20
+            crashing_now = True
+            add_reason(99, f"انهيار سعري حاد جداً خلال آخر 5 دقائق ({change_5m:.1f}%) - العملة تنهار الآن")
+        elif change_1h is not None and change_1h > 0 and change_5m <= -8:
+            # الاتجاه العام صاعد لكن آخر 5 دقايق فيها انعكاس بيع قوي = إشارة خروج مبكرة
+            score -= 5
+            add_reason(55, "انعكاس بيع قصير المدى رغم الاتجاه الصاعد العام")
 
     total = round(min(100, max(0, score)))
     if total >= EXCELLENT_SCORE:
@@ -673,13 +693,19 @@ def compute_score(security: dict, holders: dict, momentum: dict, dev: dict) -> d
 
     # hard_block: مانع صريح لخطة السكالبينغ بغض النظر عن التقييم الرقمي.
     # تركيز خطير في الحاملين = محفظة واحدة قادرة تبيع وتحرق السعر كامل خلال
-    # ثوانٍ، وهذا خطر لا يعوّضه أمان العقد أو حجم التداول الجيد في بقية الحساب.
-    hard_block = concentration_danger or (holders.get("bundled") is True)
-    block_reasons = [r for r in reasons if "تركيز" in r or "تجميع" in r or "قنص" in r]
+    # ثوانٍ، وانهيار لحظي فعلي يعني الموجة انتهت فعلاً الآن - كلاهما خطر لا
+    # يعوّضه أمان العقد أو حجم التداول الجيد في بقية الحساب.
+    mint_or_freeze_danger = security.get("mint_disabled") is False or security.get("freeze_disabled") is False
+    hard_block = concentration_danger or (holders.get("bundled") is True) or crashing_now or mint_or_freeze_danger
 
-    main_reason = reasons[0] if reasons else "لا توجد ملاحظات حرجة من الفحوصات المتاحة"
+    # ترتيب الأسباب تنازلياً حسب الخطورة الفعلية، مو حسب ترتيب الفحوصات بالكود
+    reasons.sort(key=lambda r: -r[0])
+    all_reasons = [text for _, text in reasons]
+    block_reasons = [text for sev, text in reasons if sev >= 85]
+
+    main_reason = all_reasons[0] if all_reasons else "لا توجد ملاحظات حرجة من الفحوصات المتاحة"
     return {
-        "total": total, "verdict": verdict, "main_reason": main_reason, "all_reasons": reasons,
+        "total": total, "verdict": verdict, "main_reason": main_reason, "all_reasons": all_reasons,
         "hard_block": hard_block, "block_reasons": block_reasons,
     }
 
