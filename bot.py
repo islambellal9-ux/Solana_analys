@@ -78,8 +78,18 @@ GECKOTERMINAL_OHLCV_1M_URL = (
 
 NA = "غير متوفر"
 
-# السكالبينغ يُعرض فقط للعملات اللي اجتازت هذا الحد من التقييم
-SCALP_MIN_SCORE = 70
+# حد "التركيز الخطير" في أكبر 10 محافظ — نفس الرقم المستعمل في عرض الشارة
+# الحمراء بالتقرير (🔴 تجميع خطير)، حتى ما يصيرش تناقض بين التحذير المعروض
+# والتقييم الرقمي (هذا بالضبط كان سبب فشل صفقة QBTC: 34.3% ظهرت "خطيرة"
+# في العرض لكن حسابات النقاط كانت متساهلة معها لين 40%).
+TOP10_DANGER_PCT = 25
+
+# عتبة "ممتازة" في التوصية النهائية
+EXCELLENT_SCORE = 75
+# السكالبينغ يُعرض فقط للعملات "ممتازة" فعلاً - لا لأي عملة فوق حد أدنى منفصل
+# ومنخفض، لأن هذا كان يسمح بإظهار خطة دخول كاملة لعملة توصيتها "منطقة مخاطرة"
+# في نفس الوقت (تناقض مباشر رآه المستخدم في صفقة حقيقية).
+SCALP_MIN_SCORE = EXCELLENT_SCORE
 
 
 # ------------------------------------------------------------------------- #
@@ -568,18 +578,24 @@ def compute_score(security: dict, holders: dict, momentum: dict, dev: dict) -> d
     score += sec_pts
 
     # 2) توزيع الحاملين: 25 نقطة
+    # ملاحظة مهمة: أي تركيز فوق TOP10_DANGER_PCT (25%) يُعتبر خطر "تفريغ
+    # بمحفظة واحدة" حقيقي - شفناه عملياً يحرق مارکت كاب كامل خلال دقيقة.
+    # لذا العقوبة هنا صارت أقوى بكثير من قبل، وتدخل في hard_block تحت.
     dist_pts = 0.0
     t10 = holders["top10_pct"]
+    concentration_danger = False
     if t10 is not None:
         if t10 <= 15:
             dist_pts += 18
-        elif t10 <= 25:
+        elif t10 <= TOP10_DANGER_PCT:
             dist_pts += 11
-        elif t10 <= 40:
-            dist_pts += 5
-            reasons.append("تركيز عالٍ نسبياً في أكبر 10 محافظ")
+        elif t10 <= 35:
+            dist_pts += 2
+            concentration_danger = True
+            reasons.append(f"تركيز خطير في أكبر 10 محافظ ({t10:.1f}%، فوق حد الأمان {TOP10_DANGER_PCT}%)")
         else:
-            reasons.append("تجميع خطير في أكبر 10 محافظ (أكثر من 40%)")
+            concentration_danger = True
+            reasons.append(f"تجميع خطير جداً في أكبر 10 محافظ ({t10:.1f}%)")
     if holders["bundled"] is False:
         dist_pts += 7
     elif holders["bundled"] is True:
@@ -648,15 +664,24 @@ def compute_score(security: dict, holders: dict, momentum: dict, dev: dict) -> d
         reasons.append("انعكاس بيع قصير المدى رغم الاتجاه الصاعد العام")
 
     total = round(min(100, max(0, score)))
-    if total >= 75:
+    if total >= EXCELLENT_SCORE:
         verdict = "🚀 فرصة سكالپينغ ممتازة"
     elif total >= 45:
         verdict = "⚠️ منطقة مخاطرة"
     else:
         verdict = "🔴 خطر - لا تشتري!"
 
+    # hard_block: مانع صريح لخطة السكالبينغ بغض النظر عن التقييم الرقمي.
+    # تركيز خطير في الحاملين = محفظة واحدة قادرة تبيع وتحرق السعر كامل خلال
+    # ثوانٍ، وهذا خطر لا يعوّضه أمان العقد أو حجم التداول الجيد في بقية الحساب.
+    hard_block = concentration_danger or (holders.get("bundled") is True)
+    block_reasons = [r for r in reasons if "تركيز" in r or "تجميع" in r or "قنص" in r]
+
     main_reason = reasons[0] if reasons else "لا توجد ملاحظات حرجة من الفحوصات المتاحة"
-    return {"total": total, "verdict": verdict, "main_reason": main_reason, "all_reasons": reasons}
+    return {
+        "total": total, "verdict": verdict, "main_reason": main_reason, "all_reasons": reasons,
+        "hard_block": hard_block, "block_reasons": block_reasons,
+    }
 
 
 # ------------------------------------------------------------------------- #
@@ -761,6 +786,17 @@ def green_red(cond: Optional[bool], yes_label: str, no_label: str) -> str:
 
 
 def build_scalp_section(rating: dict, scalp: Optional[dict]) -> str:
+    if rating.get("hard_block"):
+        # مانع صريح: حتى لو التقييم الرقمي عالي، تركيز خطير في الحاملين (أو
+        # قنص/حزمة لسا متحكمة) يعني محفظة واحدة تقدر تحرق السعر كامل خلال
+        # ثوانٍ. ما نعطيش خطة دخول لعملة بهذا الخطر مهما كان باقي التقييم.
+        bullet_reasons = "\n".join(f"  ▫️ {r}" for r in rating["block_reasons"]) or "  ▫️ تركيز خطير في الحاملين"
+        return (
+            "⚡ *خطة السكالبينغ والتداول (Scalp Setup):*\n"
+            f"🔴 *لا توجد خطة دخول* — رغم تقييم {rating['total']}/100، هذي العملة فيها خطر "
+            "تفريغ بمحفظة واحدة (محفظة أو مجموعة محافظ قادرة تبيع وتحرق السعر فجأة):\n"
+            f"{bullet_reasons}"
+        )
     if rating["total"] < SCALP_MIN_SCORE:
         reasons = rating["all_reasons"][:3] or ["التقييم العام تحت الحد الأدنى للسكالبينغ الآمن"]
         bullet_reasons = "\n".join(f"  ▫️ {r}" for r in reasons)
@@ -915,7 +951,7 @@ async def analyze_mint(address: str) -> str:
         # خطة السكالبينغ تحتاج قاع سعري حقيقي؛ نجيبه فقط إذا التقييم يستاهل
         # (يوفر طلبات شبكة غير ضرورية على العملات الضعيفة أصلاً).
         scalp = None
-        if rating["total"] >= SCALP_MIN_SCORE and momentum["price"]:
+        if rating["total"] >= SCALP_MIN_SCORE and not rating.get("hard_block") and momentum["price"]:
             swing = await fetch_swing_wave(session, momentum.get("pair_address"))
             scalp = compute_scalp_plan(momentum["price"], swing, momentum["liq_usd"], momentum.get("mcap"))
 
