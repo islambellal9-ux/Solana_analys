@@ -8,9 +8,12 @@ Solana Deep Scan & Scalp Bot v2.0 "Jabar Edition"
   - RugCheck       (أمان العقد، توزيع الحاملين، حرق/قفل السيولة)
   - Pump.fun       (مصدر العملة، محفظة المطوّر، حالة الهجرة لـ Raydium)
 
-يحسب تقييماً من 100، وإذا كانت العملة قوية (>=70) يولّد خطة سكالبينغ كاملة
-(منطقة دخول، هدفين، وقف خسارة، نسبة مخاطرة/عائد) مبنية على قاع سعري حقيقي
-مستخرج من بيانات GeckoTerminal OHLCV، ثم يرسل تقرير عربي منسّق على تيليغرام.
+يحسب تقييماً من 100 (مع عقوبة صريحة إذا السعر فعلاً في موجة هبوط رغم نظافة
+العقد)، وإذا كانت العملة قوية (>=70) يولّد خطة سكالبينغ مبنية على Price
+Action حقيقي لآخر موجة فقط: يكتشف Swing High/Low من شموع 5 دقائق (أو دقيقة
+واحدة كاحتياط)، ويحسب منطقة دخول Golden Zone (تصحيح فيبوناتشي 0.5-0.618)،
+وقف خسارة تحت قاع الموجة بـ1.5%، وأهداف بامتدادات فيبوناتشي 1.272/1.618 -
+ثم يرسل تقرير عربي منسّق على تيليغرام.
 
 Variables d'environnement requises :
   TELEGRAM_BOT_TOKEN   - توكن البوت من BotFather
@@ -64,9 +67,13 @@ PUMPFUN_URL = "https://frontend-api.pump.fun/coins/{mint}"
 
 GECKOTERMINAL_TOKEN_URL = "https://api.geckoterminal.com/api/v2/networks/solana/tokens/{address}"
 GECKOTERMINAL_POOLS_URL = "https://api.geckoterminal.com/api/v2/networks/solana/tokens/{address}/pools?page=1"
-GECKOTERMINAL_OHLCV_URL = (
-    "https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool}/ohlcv/hour"
-    "?aggregate=1&limit=48&currency=usd"
+GECKOTERMINAL_OHLCV_5M_URL = (
+    "https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool}/ohlcv/minute"
+    "?aggregate=5&limit=96&currency=usd"  # ~8 ساعات بشموع 5 دقائق
+)
+GECKOTERMINAL_OHLCV_1M_URL = (
+    "https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool}/ohlcv/minute"
+    "?aggregate=1&limit=180&currency=usd"  # ~3 ساعات بشموع دقيقة واحدة (احتياطي)
 )
 
 NA = "غير متوفر"
@@ -312,25 +319,75 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, address: str) -> O
     }
 
 
-async def fetch_recent_low(session: aiohttp.ClientSession, pool_address: Optional[str]) -> Optional[float]:
-    """يجيب قاع السعر الفعلي على آخر 48 ساعة من شموع GeckoTerminal (OHLCV).
+# عدد الشموع (قبل القمة) اللي نبحث فيها عن قاع الموجة الأخيرة. نحدّدها
+# حتى ما نلقطش قاع قديم من موجة سابقة ما عادش لها علاقة بالحركة الحالية.
+SWING_LOOKBACK_CANDLES = 20
 
-    يُستعمل فقط لحساب منطقة الدعم في خطة السكالبينغ. يرجّع None عند أي فشل
-    (مسار غير موجود، عنوان بركة مفقود...)، وعندها يتحول الحساب لتقدير تقريبي.
+
+def _parse_ohlcv_rows(data: Optional[dict]) -> list:
+    """يرجّع شموع [ts, open, high, low, close, volume] مرتبة من الأقدم للأحدث."""
+    rows = safe_get(data, "data", "attributes", "ohlcv_list", default=None) or []
+    parsed = []
+    for row in rows:
+        try:
+            parsed.append([float(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])])
+        except (IndexError, TypeError, ValueError):
+            continue
+    parsed.sort(key=lambda r: r[0])  # GeckoTerminal يرجّع الأحدث أولاً عادة؛ نرتبها تصاعدياً
+    return parsed
+
+
+def _find_swing_wave(candles: list) -> Optional[dict]:
+    """يحدد "الموجة الصاعدة الأخيرة" ضمن نافذة الشموع المعطاة:
+
+    - Swing High = أعلى قمة حالية ضمن النافذة (أحدث/أقوى حركة صاعدة).
+    - Swing Low  = أدنى قاع خلال آخر SWING_LOOKBACK_CANDLES شمعة قبل تلك
+      القمة مباشرة (بداية الموجة المؤدية لها)، مو قاع الجلسة كاملة.
+    """
+    if len(candles) < 5:
+        return None
+    highs = [c[2] for c in candles]
+    lows = [c[3] for c in candles]
+
+    high_idx = max(range(len(highs)), key=lambda i: highs[i])
+    swing_high = highs[high_idx]
+
+    window_start = max(0, high_idx - SWING_LOOKBACK_CANDLES)
+    segment = lows[window_start:high_idx + 1]
+    if not segment:
+        return None
+    swing_low = min(segment)
+
+    if swing_high <= swing_low or swing_low <= 0:
+        return None
+    return {"swing_low": swing_low, "swing_high": swing_high}
+
+
+async def fetch_swing_wave(session: aiohttp.ClientSession, pool_address: Optional[str]) -> Optional[dict]:
+    """يجيب "الموجة الصاعدة الأخيرة" (قاع البداية + قمة حالية) من شموع 5 دقائق،
+    وإذا فشلت (بركة جد جديدة بعدد شموع قليل) يرجع لشموع دقيقة واحدة كاحتياط.
+
+    هذا يستبدل منطق "القاع التاريخي على 48 ساعة" القديم، لأن ذاك القاع ممكن
+    يكون بعيد زمنياً وما عادش له علاقة بحركة السعر الحالية - غير مناسب للسكالبينغ.
     """
     if not pool_address:
         return None
-    data = await fetch_json(session, GECKOTERMINAL_OHLCV_URL.format(pool=pool_address))
-    rows = safe_get(data, "data", "attributes", "ohlcv_list", default=None)
-    if not rows:
-        return None
-    lows = []
-    for row in rows:
-        try:
-            lows.append(float(row[3]))  # [timestamp, open, high, low, close, volume]
-        except (IndexError, TypeError, ValueError):
-            continue
-    return min(lows) if lows else None
+
+    data_5m = await fetch_json(session, GECKOTERMINAL_OHLCV_5M_URL.format(pool=pool_address))
+    candles = _parse_ohlcv_rows(data_5m)
+    wave = _find_swing_wave(candles)
+    if wave:
+        wave["timeframe"] = "5m"
+        return wave
+
+    data_1m = await fetch_json(session, GECKOTERMINAL_OHLCV_1M_URL.format(pool=pool_address))
+    candles_1m = _parse_ohlcv_rows(data_1m)
+    wave = _find_swing_wave(candles_1m)
+    if wave:
+        wave["timeframe"] = "1m"
+        return wave
+
+    return None
 
 
 # ------------------------------------------------------------------------- #
@@ -572,6 +629,24 @@ def compute_score(security: dict, holders: dict, momentum: dict, dev: dict) -> d
             reasons.append("سيولة ضعيفة جداً، خطر مرتفع")
     score += liq_pts
 
+    # 5) تأكيد الاتجاه (Trend Confirmation): عقوبة صريحة إذا السعر فعلاً هابط
+    # بقوة رغم أن باقي المحاور (أمان/توزيع/سيولة) تبان جيدة. هذا كان ثغرة
+    # حقيقية: عملة ممكن تكون "نظيفة" من ناحية العقد لكنها أصلاً في موجة هبوط،
+    # وبلا هذا الفحص كانت تاخذ تقييم عالي رغم إنها فعلياً "تروقة" سعرية جارية.
+    change_1h = momentum.get("change_1h")
+    change_5m = momentum.get("change_5m")
+    if change_1h is not None:
+        if change_1h <= -25:
+            score -= 15
+            reasons.append("هبوط حاد جداً آخر ساعة، الموجة غالباً انتهت أو العملة تنهار")
+        elif change_1h <= -10:
+            score -= 7
+            reasons.append("ضعف واضح في السعر آخر ساعة")
+    if change_5m is not None and change_1h is not None and change_1h > 0 and change_5m <= -8:
+        # الاتجاه العام صاعد لكن آخر 5 دقايق فيها انعكاس بيع قوي = إشارة خروج مبكرة
+        score -= 5
+        reasons.append("انعكاس بيع قصير المدى رغم الاتجاه الصاعد العام")
+
     total = round(min(100, max(0, score)))
     if total >= 75:
         verdict = "🚀 فرصة سكالپينغ ممتازة"
@@ -588,39 +663,64 @@ def compute_score(security: dict, holders: dict, momentum: dict, dev: dict) -> d
 #  محرك السكالبينغ: منطقة الدخول، الأهداف، ووقف الخسارة
 # ------------------------------------------------------------------------- #
 
-def compute_scalp_plan(price: Optional[float], recent_low: Optional[float],
+# نسبة وقف الخسارة تحت قاع الموجة مباشرة (داخل مجال 1%-2% المطلوب)
+SCALP_SL_BUFFER_PCT = 0.015
+# منطقة الدخول الذهبية: تصحيح فيبوناتشي بين 0.5 و0.618 من الموجة
+FIB_ENTRY_DEEP = 0.618   # الحد الأدنى للمنطقة (تصحيح أعمق)
+FIB_ENTRY_SHALLOW = 0.50  # الحد الأعلى للمنطقة (تصحيح أخف)
+# امتدادات فيبوناتشي للأهداف، مقاسة من قاع الموجة
+FIB_TP1_EXT = 1.272
+FIB_TP2_EXT = 1.618
+
+
+def compute_scalp_plan(price: Optional[float], swing: Optional[dict],
                         liq_usd: Optional[float], mcap: Optional[float] = None) -> Optional[dict]:
-    """يبني خطة سكالبينغ كاملة حول "منطقة دعم" محسوبة.
+    """يبني خطة سكالبينغ على Price Action حقيقي لآخر موجة فقط (Recent Swing Wave):
 
-    منطقة الدعم = قاع سعري حقيقي من آخر 48 ساعة (GeckoTerminal OHLCV) إذا
-    توفر، وإلا تقدير تقريبي (-10% من السعر الحالي) كحل احتياطي معلن بوضوح
-    في التقرير. هذا حساب رياضي بسيط على بيانات حقيقية، وليس توصية مضمونة.
+    1. منطقة الدخول = "Golden Zone" — تصحيح فيبوناتشي 0.5-0.618 من قاع الموجة
+       الأخيرة (swing_low) إلى قمتها الحالية (swing_high)، مو من أي قاع تاريخي.
+    2. وقف الخسارة = تحت قاع الموجة مباشرة بـ1.5% (ضمن مجال 1-2% المطلوب).
+    3. الأهداف = امتدادات فيبوناتشي 1.272 و1.618 مقاسة من نفس الموجة، مو
+       نسبة ثابتة بلا علاقة بحجم الحركة الفعلي.
+    4. "حالة المنطقة": هل السعر الآن داخل منطقة الدخول، لسا فوقها (ننتظر
+       تصحيح)، أو كسر تحت الدعم (الإعداد بطل صالح)؟
 
-    إذا توفر mcap الحالي، نحسب "معامل التحويل" (Market Cap ÷ Price = العرض
-    المتداول الفعلي) ونستعمله لتحويل كل مستوى سعري لمستوى ماركت كاب مكافئ،
-    لأن أغلب متداولي الميم كوين يتابعون الماركت كاب مباشرة لا السعر الكسري.
+    إذا ما توفرتش بيانات شموع موثوقة (swing=None)، نرجع لتقدير تقريبي بسيط
+    معلن بوضوح في التقرير (estimated=True) بدل ما نرفض الخطة كلياً.
     """
     if not price or price <= 0:
         return None
 
-    estimated = recent_low is None
-    support = recent_low if (recent_low and 0 < recent_low < price) else price * 0.90
+    estimated = swing is None
+    if swing:
+        swing_low, swing_high = swing["swing_low"], swing["swing_high"]
+        timeframe = swing.get("timeframe", "5m")
+    else:
+        # احتياطي بسيط: نفترض موجة وهمية حول السعر الحالي حتى يبقى للخطة معنى
+        swing_low, swing_high = price * 0.85, price * 1.05
+        timeframe = NA
 
-    # إذا القاع قريب جداً من السعر الحالي (فرق أقل من 2%)، نوسّع هامش الأمان
-    # حتى يبقى وقف الخسارة له معنى عملي.
-    if price > 0 and (price - support) / price < 0.02:
-        support = price * 0.95
-        estimated = True
+    wave = swing_high - swing_low
+    if wave <= 0:
+        return None
 
-    entry_low = support * 1.00
-    entry_high = support * 1.02
-    stop_loss = support * (1 - 0.04)  # 4% تحت الدعم (داخل مجال 3-5% المطلوب)
-    tp1_low, tp1_high = entry_low * 1.15, entry_high * 1.20
-    tp2_low, tp2_high = entry_low * 1.35, entry_high * 1.50
+    entry_low = swing_high - wave * FIB_ENTRY_DEEP      # تصحيح 0.618 (أعمق)
+    entry_high = swing_high - wave * FIB_ENTRY_SHALLOW  # تصحيح 0.50 (أخف)
+    stop_loss = swing_low * (1 - SCALP_SL_BUFFER_PCT)
+    tp1 = swing_low + wave * FIB_TP1_EXT
+    tp2 = swing_low + wave * FIB_TP2_EXT
 
     risk = entry_low - stop_loss
-    reward = tp1_low - entry_low
+    reward = tp1 - entry_low
     rr = (reward / risk) if risk > 0 else None
+
+    # حالة منطقة الدخول بالنسبة للسعر الحالي الآن
+    if price < stop_loss:
+        zone_status = "🔴 السعر كسر تحت الدعم — هذا الإعداد بطل صالح، لا تدخل."
+    elif price <= entry_high:
+        zone_status = "🟢 السعر داخل منطقة الدخول حالياً."
+    else:
+        zone_status = "⏳ السعر لسا فوق منطقة الدخول — استنى تصحيح للمنطقة قبل الدخول."
 
     liq_note = None
     if liq_usd is not None and liq_usd < 15_000:
@@ -640,13 +740,13 @@ def compute_scalp_plan(price: Optional[float], recent_low: Optional[float],
     return {
         "entry_low": entry_low, "entry_high": entry_high,
         "stop_loss": stop_loss,
-        "tp1_low": tp1_low, "tp1_high": tp1_high,
-        "tp2_low": tp2_low, "tp2_high": tp2_high,
+        "tp1": tp1, "tp2": tp2,
+        "swing_low": swing_low, "swing_high": swing_high, "timeframe": timeframe,
+        "zone_status": zone_status,
         "rr": rr, "estimated": estimated, "liq_note": liq_note,
         "mcap_entry_low": to_mcap(entry_low), "mcap_entry_high": to_mcap(entry_high),
         "mcap_stop_loss": to_mcap(stop_loss),
-        "mcap_tp1_low": to_mcap(tp1_low), "mcap_tp1_high": to_mcap(tp1_high),
-        "mcap_tp2_low": to_mcap(tp2_low), "mcap_tp2_high": to_mcap(tp2_high),
+        "mcap_tp1": to_mcap(tp1), "mcap_tp2": to_mcap(tp2),
     }
 
 
@@ -675,22 +775,36 @@ def build_scalp_section(rating: dict, scalp: Optional[dict]) -> str:
             "⚠️ التقييم إيجابي لكن ما كفاش بيانات سعرية موثوقة لحساب منطقة دخول دقيقة."
         )
 
-    est_tag = " _(تقدير تقريبي، ما كانش قاع سعري مؤكد)_" if scalp["estimated"] else " _(مبني على قاع سعري فعلي 48 ساعة)_"
+    tf_label = {"5m": "شموع 5 دقائق", "1m": "شموع دقيقة واحدة"}.get(scalp["timeframe"], scalp["timeframe"])
+    est_tag = (
+        " _(تقدير تقريبي، ما قدرناش نجيب شموع موثوقة)_"
+        if scalp["estimated"]
+        else f" _(مبني على Golden Zone لآخر موجة — {tf_label})_"
+    )
     rr_line = f"1:{scalp['rr']:.1f}" if scalp["rr"] else NA
 
-    def level(label_price, label_mcap_prefix, lo, hi, mlo, mhi, suffix=""):
-        price_part = f"{fmt_price(lo)} — {fmt_price(hi)}{suffix}"
-        if mlo is not None and mhi is not None:
-            price_part += f"\n   💠 بالماركت كاب: {fmt_usd(mlo)} — {fmt_usd(mhi)}"
-        return price_part
+    def level(label, p, mp, extra_pct=None):
+        s = f"{label} {fmt_price(p)}"
+        if extra_pct is not None:
+            s += f" ({'+' if extra_pct >= 0 else ''}{extra_pct:.0f}%)"
+        if mp is not None:
+            s += f"\n   💠 {fmt_usd(mp)}"
+        return s
+
+    entry_mid = (scalp["entry_low"] + scalp["entry_high"]) / 2
+    tp1_pct = (scalp["tp1"] / entry_mid - 1) * 100 if entry_mid else None
+    tp2_pct = (scalp["tp2"] / entry_mid - 1) * 100 if entry_mid else None
+    sl_pct = (scalp["stop_loss"] / entry_mid - 1) * 100 if entry_mid else None
 
     lines = [
         "⚡ *خطة السكالبينغ والتداول (Scalp Setup):*",
-        f"🎯 *منطقة الدخول:* {level(None, None, scalp['entry_low'], scalp['entry_high'], scalp['mcap_entry_low'], scalp['mcap_entry_high'], est_tag)}",
-        f"🚀 *الهدف الأول (TP1) +15% إلى +20%:* {level(None, None, scalp['tp1_low'], scalp['tp1_high'], scalp['mcap_tp1_low'], scalp['mcap_tp1_high'])}",
-        f"🚀 *الهدف الثاني (TP2) +35% إلى +50%:* {level(None, None, scalp['tp2_low'], scalp['tp2_high'], scalp['mcap_tp2_low'], scalp['mcap_tp2_high'])}",
-        f"🛑 *وقف الخسارة (تحت الدعم بـ4%):* {fmt_price(scalp['stop_loss'])}"
-        + (f"\n   💠 بالماركت كاب: {fmt_usd(scalp['mcap_stop_loss'])}" if scalp['mcap_stop_loss'] is not None else ""),
+        f"📐 *الموجة الأخيرة:* قاع {fmt_price(scalp['swing_low'])} ← قمة {fmt_price(scalp['swing_high'])}",
+        f"{scalp['zone_status']}",
+        f"🎯 *منطقة الدخول (Golden Zone 0.5-0.618):* {fmt_price(scalp['entry_low'])} — {fmt_price(scalp['entry_high'])}{est_tag}"
+        + (f"\n   💠 {fmt_usd(scalp['mcap_entry_low'])} — {fmt_usd(scalp['mcap_entry_high'])}" if scalp['mcap_entry_low'] is not None else ""),
+        f"🚀 {level('*الهدف الأول (TP1 — امتداد 1.272):*', scalp['tp1'], scalp['mcap_tp1'], tp1_pct)}",
+        f"🚀 {level('*الهدف الثاني (TP2 — امتداد 1.618):*', scalp['tp2'], scalp['mcap_tp2'], tp2_pct)}",
+        f"🛑 {level('*وقف الخسارة (تحت قاع الموجة بـ1.5%):*', scalp['stop_loss'], scalp['mcap_stop_loss'], sl_pct)}",
         f"⚖️ *نسبة المخاطرة/العائد:* {rr_line}",
     ]
     if scalp["liq_note"]:
@@ -802,8 +916,8 @@ async def analyze_mint(address: str) -> str:
         # (يوفر طلبات شبكة غير ضرورية على العملات الضعيفة أصلاً).
         scalp = None
         if rating["total"] >= SCALP_MIN_SCORE and momentum["price"]:
-            recent_low = await fetch_recent_low(session, momentum.get("pair_address"))
-            scalp = compute_scalp_plan(momentum["price"], recent_low, momentum["liq_usd"], momentum.get("mcap"))
+            swing = await fetch_swing_wave(session, momentum.get("pair_address"))
+            scalp = compute_scalp_plan(momentum["price"], swing, momentum["liq_usd"], momentum.get("mcap"))
 
     if used_fallback:
         log.info("Used GeckoTerminal fallback for %s", address)
