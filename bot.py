@@ -83,6 +83,9 @@ NA = "غير متوفر"
 # والتقييم الرقمي (هذا بالضبط كان سبب فشل صفقة QBTC: 34.3% ظهرت "خطيرة"
 # في العرض لكن حسابات النقاط كانت متساهلة معها لين 40%).
 TOP10_DANGER_PCT = 25
+# فوق هذا الرقم، التركيز يُعتبر متطرف ويُمنع مطلقاً بغض النظر عن الزخم -
+# محفظة وحدة أو اثنتين تملك أكثر من نصف العرض، خطر تفريغ فوري حقيقي جداً.
+TOP10_EXTREME_PCT = 50
 
 # عتبة "ممتازة" في التوصية النهائية
 EXCELLENT_SCORE = 75
@@ -589,12 +592,16 @@ def compute_score(security: dict, holders: dict, momentum: dict, dev: dict) -> d
     score += sec_pts
 
     # 2) توزيع الحاملين: 25 نقطة
-    # ملاحظة مهمة: أي تركيز فوق TOP10_DANGER_PCT (25%) يُعتبر خطر "تفريغ
-    # بمحفظة واحدة" حقيقي - شفناه عملياً يحرق مارکت كاب كامل خلال دقيقة.
-    # لذا العقوبة هنا صارت أقوى بكثير من قبل، وتدخل في hard_block تحت.
+    # ملاحظة مهمة: التركيز وحده ما يكفيش يحدد الخطر. شفنا عملياً عملة بتركيز
+    # 32.2% (فوق حد الأمان 25%) طارت +150% لأن الزخم كان قوي وحقيقي (شراء
+    # متواصل وحجم عالي)، وعملة تانية بتركيز 55% انهارت لأنها كانت أصلاً في
+    # موجة بيع. فالمنع الصريح دابا يتفعّل تلقائياً فقط للتركيز المتطرف جداً
+    # (فوق TOP10_EXTREME_PCT)، أما التركيز المتوسط (25-50%) فيتحول لـ"حذر"
+    # يسمح بخطة مصغّرة فقط إذا الزخم فعلاً قوي ومؤكد (strong_momentum تحت).
     dist_pts = 0.0
     t10 = holders["top10_pct"]
-    concentration_danger = False
+    concentration_extreme = False
+    concentration_caution = False
     if t10 is not None:
         if t10 <= 15:
             dist_pts += 18
@@ -602,11 +609,15 @@ def compute_score(security: dict, holders: dict, momentum: dict, dev: dict) -> d
             dist_pts += 11
         elif t10 <= 35:
             dist_pts += 2
-            concentration_danger = True
-            add_reason(90, f"تركيز خطير في أكبر 10 محافظ ({t10:.1f}%، فوق حد الأمان {TOP10_DANGER_PCT}%)")
+            concentration_caution = True
+            add_reason(70, f"تركيز مرتفع في أكبر 10 محافظ ({t10:.1f}%، فوق حد الأمان {TOP10_DANGER_PCT}%)")
+        elif t10 <= TOP10_EXTREME_PCT:
+            dist_pts += 0
+            concentration_caution = True
+            add_reason(80, f"تركيز مرتفع جداً في أكبر 10 محافظ ({t10:.1f}%)")
         else:
-            concentration_danger = True
-            add_reason(98, f"تجميع خطير جداً في أكبر 10 محافظ ({t10:.1f}%)")
+            concentration_extreme = True
+            add_reason(98, f"تجميع متطرف وخطير في أكبر 10 محافظ ({t10:.1f}%، فوق {TOP10_EXTREME_PCT}%)")
     if holders["bundled"] is False:
         dist_pts += 7
     elif holders["bundled"] is True:
@@ -683,30 +694,62 @@ def compute_score(security: dict, holders: dict, momentum: dict, dev: dict) -> d
             score -= 5
             add_reason(55, "انعكاس بيع قصير المدى رغم الاتجاه الصاعد العام")
 
+    # 6) مكافأة الزخم القوي (Momentum Strength Bonus): زخم شرائي حقيقي ومستمر
+    # (مو قفزة لحظية وحدة) هو أقوى إشارة فعلية على اهتمام عضوي متواصل. هذا
+    # الشرط بالضبط هو اللي ميّز عملة "Jef" (طارت +150%) عن عملة "Butt" (انهارت):
+    # كلاهما تركيز حاملين مرتفع، لكن واحدة زخمها قوي صاعد والثانية كانت تنهار.
+    buys_ok = buys is not None and sells is not None and (buys + sells) >= 20
+    bratio_strong = buys_ok and (buys / max(sells, 1)) >= 1.1
+    strong_momentum = bool(
+        change_1h is not None and change_1h >= 50
+        and change_5m is not None and change_5m > 0
+        and bratio_strong
+    )
+    if strong_momentum:
+        score += 8
+        add_reason(5, "زخم شرائي قوي ومستمر (إشارة إيجابية)")
+
     total = round(min(100, max(0, score)))
-    if total >= EXCELLENT_SCORE:
+
+    # hard_block: مانع صريح مطلق لخطة السكالبينغ، بغض النظر عن التقييم أو
+    # الزخم - هذي مخاطر "صفرية التسامح" (نصب كامل أو انهيار مؤكد الآن).
+    mint_or_freeze_danger = security.get("mint_disabled") is False or security.get("freeze_disabled") is False
+    hard_block = concentration_extreme or (holders.get("bundled") is True) or crashing_now or mint_or_freeze_danger
+
+    # caution_block: تركيز مرتفع (25-50%) بلا زخم قوي يثبت إنه مو خطر وشيك -
+    # ما نمنعش منعاً مطلقاً، لكن ما نعطيش خطة دخول إلا لو الزخم أثبت نفسه.
+    reduced_size = concentration_caution and strong_momentum and not hard_block
+    caution_block = concentration_caution and not strong_momentum and not hard_block
+
+    # التوصية (verdict) لازم تعكس hard_block/caution_block بصراحة، حتى ما
+    # يصيرش تناقض زي اللي صار: "78/100 - فرصة ممتازة" وفي نفس الوقت "لا توجد
+    # خطة دخول" في نفس الرسالة. التوصية دابا مبنية على القرار الفعلي، مو
+    # الرقم الخام بمعزل عن باقي الفحوصات.
+    if hard_block:
+        verdict = "🔴 خطر - لا تشتري!"
+    elif caution_block:
+        verdict = "⚠️ منطقة مخاطرة"
+    elif reduced_size:
+        verdict = "🟡 فرصة بحذر (تركيز مرتفع، الزخم يعوّضه جزئياً)"
+    elif total >= EXCELLENT_SCORE:
         verdict = "🚀 فرصة سكالپينغ ممتازة"
     elif total >= 45:
         verdict = "⚠️ منطقة مخاطرة"
     else:
         verdict = "🔴 خطر - لا تشتري!"
 
-    # hard_block: مانع صريح لخطة السكالبينغ بغض النظر عن التقييم الرقمي.
-    # تركيز خطير في الحاملين = محفظة واحدة قادرة تبيع وتحرق السعر كامل خلال
-    # ثوانٍ، وانهيار لحظي فعلي يعني الموجة انتهت فعلاً الآن - كلاهما خطر لا
-    # يعوّضه أمان العقد أو حجم التداول الجيد في بقية الحساب.
-    mint_or_freeze_danger = security.get("mint_disabled") is False or security.get("freeze_disabled") is False
-    hard_block = concentration_danger or (holders.get("bundled") is True) or crashing_now or mint_or_freeze_danger
-
     # ترتيب الأسباب تنازلياً حسب الخطورة الفعلية، مو حسب ترتيب الفحوصات بالكود
     reasons.sort(key=lambda r: -r[0])
     all_reasons = [text for _, text in reasons]
     block_reasons = [text for sev, text in reasons if sev >= 85]
+    caution_reasons = [text for sev, text in reasons if 65 <= sev < 85]
 
     main_reason = all_reasons[0] if all_reasons else "لا توجد ملاحظات حرجة من الفحوصات المتاحة"
     return {
         "total": total, "verdict": verdict, "main_reason": main_reason, "all_reasons": all_reasons,
         "hard_block": hard_block, "block_reasons": block_reasons,
+        "caution_block": caution_block, "caution_reasons": caution_reasons,
+        "reduced_size": reduced_size, "strong_momentum": strong_momentum,
     }
 
 
@@ -813,14 +856,24 @@ def green_red(cond: Optional[bool], yes_label: str, no_label: str) -> str:
 
 def build_scalp_section(rating: dict, scalp: Optional[dict]) -> str:
     if rating.get("hard_block"):
-        # مانع صريح: حتى لو التقييم الرقمي عالي، تركيز خطير في الحاملين (أو
-        # قنص/حزمة لسا متحكمة) يعني محفظة واحدة تقدر تحرق السعر كامل خلال
-        # ثوانٍ. ما نعطيش خطة دخول لعملة بهذا الخطر مهما كان باقي التقييم.
-        bullet_reasons = "\n".join(f"  ▫️ {r}" for r in rating["block_reasons"]) or "  ▫️ تركيز خطير في الحاملين"
+        # مانع صريح مطلق: نصب كامل (Mint/Freeze)، تجميع متطرف (>50%)، قنص
+        # لسا متحكم، أو انهيار مؤكد الآن. لا استثناء هنا مهما كان الزخم.
+        bullet_reasons = "\n".join(f"  ▫️ {r}" for r in rating["block_reasons"]) or "  ▫️ خطر حرج في الفحوصات"
         return (
             "⚡ *خطة السكالبينغ والتداول (Scalp Setup):*\n"
             f"🔴 *لا توجد خطة دخول* — رغم تقييم {rating['total']}/100، هذي العملة فيها خطر "
-            "تفريغ بمحفظة واحدة (محفظة أو مجموعة محافظ قادرة تبيع وتحرق السعر فجأة):\n"
+            "حرج (تفريغ محفظة واحدة، نصب كامل، أو انهيار مؤكد الآن):\n"
+            f"{bullet_reasons}"
+        )
+    if rating.get("caution_block"):
+        # تركيز مرتفع (25-50%) بلا زخم قوي يثبت إنه مو خطر وشيك. ما منعناهاش
+        # منعاً مطلقاً (زي hard_block) لأنها ممكن تكون فرصة حقيقية، لكن بلا
+        # دليل زخم واضح ما نعطيش خطة دخول بأرقام دقيقة.
+        bullet_reasons = "\n".join(f"  ▫️ {r}" for r in rating["caution_reasons"]) or "  ▫️ تركيز مرتفع بلا زخم مؤكد"
+        return (
+            "⚡ *خطة السكالبينغ والتداول (Scalp Setup):*\n"
+            f"🟡 *لا توجد خطة دخول دقيقة* — تقييم {rating['total']}/100، تركيز الحاملين مرتفع "
+            "وما فيش دليل زخم قوي يعوّضه حالياً (راقبها: إذا الحجم والشراء زادوا بقوة، فرصة ممكنة):\n"
             f"{bullet_reasons}"
         )
     if rating["total"] < SCALP_MIN_SCORE:
@@ -860,6 +913,13 @@ def build_scalp_section(rating: dict, scalp: Optional[dict]) -> str:
 
     lines = [
         "⚡ *خطة السكالبينغ والتداول (Scalp Setup):*",
+    ]
+    if rating.get("reduced_size"):
+        lines.append(
+            "🟡 *تحذير:* تركيز الحاملين مرتفع، لكن الزخم الشرائي قوي ومستمر وهذا يعوّضه جزئياً. "
+            "ادخل بنص الحجم المعتاد فقط، وخروج أسرع من المعتاد."
+        )
+    lines += [
         f"📐 *الموجة الأخيرة:* قاع {fmt_price(scalp['swing_low'])} ← قمة {fmt_price(scalp['swing_high'])}",
         f"{scalp['zone_status']}",
         f"🎯 *منطقة الدخول (Golden Zone 0.5-0.618):* {fmt_price(scalp['entry_low'])} — {fmt_price(scalp['entry_high'])}{est_tag}"
@@ -956,6 +1016,22 @@ async def analyze_mint(address: str) -> str:
                 "وما زالت البيانات ما توصلتش لأي مصدر بعد."
             )
 
+        # ثغرة حقيقية انصلحت: إذا DexScreener وGeckoTerminal فشلوا الاثنين
+        # (ما كاين سعر ولا سيولة ولا حجم) لكن RugCheck نجح، كان الكود قبل
+        # يكمّل ويحسب تقييم كامل من 100 رغم إن 35 نقطة (سيولة+حجم) ما تنحسبش
+        # أصلاً = تقييم منخفض بشكل مضلل ("41/100 خطر") سببه نقص بيانات، مو
+        # خطر حقيقي بالعملة. دابا نوقف هنا ونوضح الوضع بصراحة بدل رقم كاذب.
+        if not dex:
+            name_only = safe_get(rug, "tokenMeta", "name", default=None) or safe_get(pump, "name", default=None)
+            return (
+                f"⚠️ {('عملة ' + name_only) if name_only else 'هذي العملة'} ما عندها بيانات سعر أو سيولة أو حجم "
+                "تداول متوفرة حالياً (DexScreener وGeckoTerminal ما لقوش بركة نشطة لها).\n\n"
+                "هذا يصير عادة إذا: العملة جد جديدة وما تسجلتش في الفهرسة بعد، أو بعثت عنوان العملة "
+                "(Token Mint) مكان عنوان البركة (Pair) أو العكس.\n\n"
+                "ما نقدرش نعطي تقييماً موثوقاً أو خطة سكالبينغ بلا بيانات السعر والسيولة. "
+                "جرّب بعد شوية، أو تأكد من العنوان."
+            )
+
         name = (
             safe_get(dex, "baseToken", "name", default=None)
             or safe_get(pump, "name", default=None)
@@ -975,9 +1051,14 @@ async def analyze_mint(address: str) -> str:
         rating = compute_score(security, holders, momentum, dev)
 
         # خطة السكالبينغ تحتاج قاع سعري حقيقي؛ نجيبه فقط إذا التقييم يستاهل
-        # (يوفر طلبات شبكة غير ضرورية على العملات الضعيفة أصلاً).
+        # (يوفر طلبات شبكة غير ضرورية على العملات الضعيفة أصلاً). عملة بتركيز
+        # مرتفع لكن بزخم قوي مؤكد (reduced_size) تستاهل خطة مصغّرة حتى لو
+        # التقييم الخام ما وصلش SCALP_MIN_SCORE، لأن عقوبة التركيز نزّلته
+        # صناعياً رغم إن الزخم يعوّضها جزئياً.
         scalp = None
-        if rating["total"] >= SCALP_MIN_SCORE and not rating.get("hard_block") and momentum["price"]:
+        eligible = (rating["total"] >= SCALP_MIN_SCORE or rating.get("reduced_size")) \
+            and not rating.get("hard_block") and not rating.get("caution_block")
+        if eligible and momentum["price"]:
             swing = await fetch_swing_wave(session, momentum.get("pair_address"))
             scalp = compute_scalp_plan(momentum["price"], swing, momentum["liq_usd"], momentum.get("mcap"))
 
