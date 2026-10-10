@@ -86,6 +86,9 @@ TOP10_DANGER_PCT = 25
 # فوق هذا الرقم، التركيز يُعتبر متطرف ويُمنع مطلقاً بغض النظر عن الزخم -
 # محفظة وحدة أو اثنتين تملك أكثر من نصف العرض، خطر تفريغ فوري حقيقي جداً.
 TOP10_EXTREME_PCT = 50
+# تحت هذا الرقم، السيولة حرجة لدرجة إن التنفيذ الحقيقي شبه مستحيل (انزلاق
+# كامل أو بركة فارغة عملياً)، بغض النظر عن أي إشارة إيجابية أخرى.
+MIN_VIABLE_LIQUIDITY = 1000
 
 # عتبة "ممتازة" في التوصية النهائية
 EXCELLENT_SCORE = 75
@@ -630,7 +633,8 @@ def compute_score(security: dict, holders: dict, momentum: dict, dev: dict) -> d
 
     # 3) الحجم ونسبة الشراء/البيع: 20 نقطة
     vol_pts = 0.0
-    liq = momentum["liq_usd"] or 0
+    liq_usd_raw = momentum["liq_usd"]  # نحتفظ بالقيمة الخام (ممكن None أو 0.0 فعلياً) لفحص السيولة الحرجة تحت
+    liq = liq_usd_raw or 0
     vol5 = momentum["vol_5m"]
     buys, sells = momentum["buys_5m"], momentum["sells_5m"]
     if liq and vol5 is not None:
@@ -698,23 +702,51 @@ def compute_score(security: dict, holders: dict, momentum: dict, dev: dict) -> d
     # (مو قفزة لحظية وحدة) هو أقوى إشارة فعلية على اهتمام عضوي متواصل. هذا
     # الشرط بالضبط هو اللي ميّز عملة "Jef" (طارت +150%) عن عملة "Butt" (انهارت):
     # كلاهما تركيز حاملين مرتفع، لكن واحدة زخمها قوي صاعد والثانية كانت تنهار.
+    #
+    # ثغرة حقيقية انصلحت هنا: عملة "Pump Museum" كان عندها change_1h=+91%
+    # (يجتاز الشرط القديم) لكن انهارت -89% بعدها، لأن حجم التداول كان فعلياً
+    # ميت (1.5K آخر 5 دقايق مقابل 83.4K متوسط الساعة = الموجة خلصت والزخم
+    # كان أثر قديم من قمة سابقة، مو شراء مستمر). عملة "Jef" الناجحة كان عندها
+    # حجم 5 دقايق أعلى من المعدل الساعي بـ5 أضعاف - زخم حقيقي متواصل فعلاً.
+    # فحص "نبض الحجم" (Volume Pace) هذا ضروري، مو السعر والنسبة لوحدهم.
+    vol1h = momentum.get("vol_1h")
+    vol_pace_ratio = None
+    if vol5 is not None and vol1h is not None and vol1h > 0:
+        vol_pace_ratio = (vol5 * 12) / vol1h  # نسبة معدل آخر 5 دقايق لمعدل الساعة الكامل
+    pace_sustained = vol_pace_ratio is not None and vol_pace_ratio >= 1.0
+    if vol_pace_ratio is not None and vol_pace_ratio < 0.4:
+        add_reason(65, "حجم التداول يتباطأ بقوة مقارنة بمتوسط الساعة (الموجة غالباً خلصت)")
+
     buys_ok = buys is not None and sells is not None and (buys + sells) >= 20
     bratio_strong = buys_ok and (buys / max(sells, 1)) >= 1.1
     strong_momentum = bool(
         change_1h is not None and change_1h >= 50
         and change_5m is not None and change_5m > 0
         and bratio_strong
+        and pace_sustained
     )
     if strong_momentum:
         score += 8
-        add_reason(5, "زخم شرائي قوي ومستمر (إشارة إيجابية)")
+        add_reason(5, "زخم شرائي قوي ومستمر مع حجم متصاعد (إشارة إيجابية)")
 
     total = round(min(100, max(0, score)))
 
+    # ثغرة ثانية انصلحت: عملة "paper-chan" عندها سيولة مُبلّغة = $0.00 حرفياً
+    # (مو مفقودة، بل صفر فعلي من GeckoTerminal)، وهذا يعني عملياً إنه ما
+    # يمكنش تنفيذ صفقة حقيقية فيها (انزلاق كامل أو بركة شبه فارغة). هذا خطر
+    # تنفيذي أساسي، لازم يمنع مطلقاً بغض النظر عن الزخم أو التقييم.
+    liquidity_critical = liq_usd_raw is not None and liq_usd_raw < MIN_VIABLE_LIQUIDITY
+
     # hard_block: مانع صريح مطلق لخطة السكالبينغ، بغض النظر عن التقييم أو
-    # الزخم - هذي مخاطر "صفرية التسامح" (نصب كامل أو انهيار مؤكد الآن).
+    # الزخم - هذي مخاطر "صفرية التسامح" (نصب كامل، سيولة غير قابلة للتنفيذ،
+    # أو انهيار مؤكد الآن).
     mint_or_freeze_danger = security.get("mint_disabled") is False or security.get("freeze_disabled") is False
-    hard_block = concentration_extreme or (holders.get("bundled") is True) or crashing_now or mint_or_freeze_danger
+    hard_block = (
+        concentration_extreme or (holders.get("bundled") is True) or crashing_now
+        or mint_or_freeze_danger or liquidity_critical
+    )
+    if liquidity_critical:
+        add_reason(99, f"سيولة حرجة جداً (${liq_usd_raw:,.0f}) - التنفيذ غير ممكن عملياً")
 
     # caution_block: تركيز مرتفع (25-50%) بلا زخم قوي يثبت إنه مو خطر وشيك -
     # ما نمنعش منعاً مطلقاً، لكن ما نعطيش خطة دخول إلا لو الزخم أثبت نفسه.
@@ -876,7 +908,9 @@ def build_scalp_section(rating: dict, scalp: Optional[dict]) -> str:
             "وما فيش دليل زخم قوي يعوّضه حالياً (راقبها: إذا الحجم والشراء زادوا بقوة، فرصة ممكنة):\n"
             f"{bullet_reasons}"
         )
-    if rating["total"] < SCALP_MIN_SCORE:
+    # ثغرة انصلحت: reduced_size لازم يتجاوز هذا الحد، مو يتوقف عليه - عقوبة
+    # التركيز تنزّل التقييم الخام صناعياً حتى لو الزخم أثبت نفسه فعلاً.
+    if rating["total"] < SCALP_MIN_SCORE and not rating.get("reduced_size"):
         reasons = rating["all_reasons"][:3] or ["التقييم العام تحت الحد الأدنى للسكالبينغ الآمن"]
         bullet_reasons = "\n".join(f"  ▫️ {r}" for r in reasons)
         return (
