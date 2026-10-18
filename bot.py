@@ -1,1167 +1,2920 @@
-#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Solana Deep Scan & Scalp Bot v2.0 "Jabar Edition"
+SolAlpha Sniper v4.0 — Telegram bot (Render Web Service)
+مصدر العملات: قناة الإشارات https://t.me/solhousesignal حصرياً.
+طريقة القراءة (بالترتيب): 0) الوضع اليدوي: ترسل للبوت عقوداً أو تحوّل (Forward) رسائل الإشارات فيحللها /best (لا يحتاج أي إعداد)
+                          1) Telethon بجلسة مستخدم (TELETHON_SESSION) — الأوثق
+                          2) HTTP على مرايا المعاينة العامة (t.me/s وأخواتها) كاحتياط
+ملاحظة: حسابات البوت لا تستطيع قراءة سجل القنوات (BotMethodInvalidError) فلا تُستخدم.
 
-يفحص أي عنوان (Token Mint Address أو Pair/Pool Address) على سولانا عبر:
-  - DexScreener    (المصدر الأساسي: السعر، السيولة، الحجم، البيع/الشراء)
-  - GeckoTerminal  (مصدر احتياطي تلقائي للعملات الجديدة جداً اللي ما توصلتش لـ DexScreener بعد)
-  - RugCheck       (أمان العقد، توزيع الحاملين، حرق/قفل السيولة)
-  - Pump.fun       (مصدر العملة، محفظة المطوّر، حالة الهجرة لـ Raydium)
+/best : يقرأ آخر رسائل القناة → يستخرج عقود Solana → يفحصها ويعطيك أفضل صفقة + نوعها + بدائل
+/diag : تشخيص مصدر القراءة (Telethon/HTTP) وفلترة العقود
+/help : شرح
 
-يحسب تقييماً من 100 (مع عقوبة صريحة إذا السعر فعلاً في موجة هبوط رغم نظافة
-العقد)، وإذا كانت العملة قوية (>=70) يولّد خطة سكالبينغ مبنية على Price
-Action حقيقي لآخر موجة فقط: يكتشف Swing High/Low من شموع 5 دقائق (أو دقيقة
-واحدة كاحتياط)، ويحسب منطقة دخول Golden Zone (تصحيح فيبوناتشي 0.5-0.618)،
-وقف خسارة تحت قاع الموجة بـ1.5%، وأهداف بامتدادات فيبوناتشي 1.272/1.618 -
-ثم يرسل تقرير عربي منسّق على تيليغرام.
+أنواع الصفقات:
+  ⚡ SCALP    : دخول من Fibonacci Golden Zone (0.5–0.618)، هدف +18% / +25%
+  🚀 MOMENTUM : عملة تصعد بفوليوم متسارع، هدف +15% / +30%
+  🧭 HOLD     : عملة أقدم (24h+) بسيولة وفوليوم جيدين، هدف +50% / +100%
 
-Variables d'environnement requises :
-  TELEGRAM_BOT_TOKEN   - توكن البوت من BotFather
-  PORT                 - منفذ Health Check (افتراضي 10000، يضبطه Render تلقائياً)
+الحظر الصلب (لا يُخفَّف أبداً): Mint/Freeze ملغاة، LP محروقة/مقفولة، ليست Rugged، لا Danger في RugCheck.
+أما Dev/Top10/Insider/تقييم RugCheck فتخفض الـ Score وتظهر كتحذيرات (المستوى B).
 
-Déploiement Render : Web Service, Start Command -> python bot.py
+متغيرات البيئة:
+  TELEGRAM_BOT_TOKEN (مطلوب) | PORT و RENDER_EXTERNAL_URL (تضبطهما Render)
+  TELEGRAM_API_ID + TELEGRAM_API_HASH (مطلوبان — من https://my.telegram.org → API development tools)
+  TELETHON_SESSION : StringSession لحساب مستخدم، تولّدها مرة واحدة محلياً بـ gen_session.py
+  SIGNAL_HTTP_MIRRORS (اختياري) : قوالب روابط مفصولة بفاصلة، فيها {ch}، تُجرَّب بالترتيب
+  SIGNAL_CHANNEL (افتراضي solhousesignal) | SIGNAL_MESSAGE_LIMIT (افتراضي 60) | SIGNAL_MAX_AGE_HOURS (افتراضي 24)
+  ALLOW_RISKY=0 للصرامة الكاملة
 """
 
 import asyncio
+import html
+import io
+import json
 import logging
+import math
 import os
 import re
-import threading
+import signal
 import time
-from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from collections import Counter
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Optional
 
-import aiohttp
+import httpx
+from aiohttp import web
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telethon import TelegramClient
+from telethon.sessions import StringSession
 
-# ------------------------------------------------------------------------- #
-#  الإعدادات العامة
-# ------------------------------------------------------------------------- #
+# ───────────────────────────── الإعدادات ─────────────────────────────
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+MIN_SCORE = _env_float("MIN_SCORE", 80)            # 🟢 قوية (مع المستوى A)
+RISKY_MIN_SCORE = _env_float("RISKY_MIN_SCORE", 65)  # 🟡 متوسطة
+
+# فلتر أولي صلب
+MIN_LIQUIDITY_USD = _env_float("MIN_LIQUIDITY_USD", 8_000)
+MIN_VOLUME_H1_USD = _env_float("MIN_VOLUME_H1_USD", 5_000)
+MIN_MCAP_USD = _env_float("MIN_MCAP_USD", 15_000)
+MAX_MCAP_USD = _env_float("MAX_MCAP_USD", 100_000_000)
+MIN_PAIR_AGE_MIN = _env_float("MIN_PAIR_AGE_MIN", 3)
+MOMENTUM_MAX_H1_PCT = _env_float("MOMENTUM_MAX_H1_PCT", 100)   # فوقه = مطاردة قمة (Cart +123% انهارت −87%)
+# تحت هذه القيم تُقبل العملة لكن بتحذير صريح وعقوبة في التقييم (لا تُرفض)
+FLAG_LIQ_USD = _env_float("FLAG_LIQ_USD", 15_000)
+FLAG_MCAP_USD = _env_float("FLAG_MCAP_USD", 30_000)
+FLAG_AGE_MIN = _env_float("FLAG_AGE_MIN", 45)
+MARKET_FLAG_PENALTY = 4
+MAX_H1_CHANGE_PCT = _env_float("MAX_H1_CHANGE_PCT", 300)
+MAX_5M_DROP_PCT = _env_float("MAX_5M_DROP_PCT", 10)
+MAX_1H_DROP_PCT = _env_float("MAX_1H_DROP_PCT", 25)
+
+# الأمان
+MAX_DEV_PCT = _env_float("MAX_DEV_PCT", 5)
+MAX_TOP10_PCT = _env_float("MAX_TOP10_PCT", 25)
+MIN_LP_LOCKED_PCT = _env_float("MIN_LP_LOCKED_PCT", 95)
+RUGCHECK_MAX_NORM = _env_float("RUGCHECK_MAX_NORM", 20)
+RUGCHECK_MAX_RAW = _env_float("RUGCHECK_MAX_RAW", 500)
+ALLOW_RISKY = _env_float("ALLOW_RISKY", 1) >= 1
+RISKY_MAX_TOP10_PCT = _env_float("RISKY_MAX_TOP10_PCT", 50)
+RISKY_MAX_DEV_PCT = _env_float("RISKY_MAX_DEV_PCT", 10)
+RISKY_MAX_RUG_NORM = _env_float("RISKY_MAX_RUG_NORM", 50)
+RISK_PENALTY = 8
+
+# Fibonacci / الخطط
+MIN_CANDLES = 20
+MAX_WINDOW_CANDLES = 72
+SWING_LOOKBACK_CANDLES = 36
+MIN_LEG_PCT = _env_float("MIN_LEG_PCT", 12)
+MAX_ABOVE_ZONE_PCT = _env_float("MAX_ABOVE_ZONE_PCT", 10)
+MAX_SL_RISK_PCT = _env_float("MAX_SL_RISK_PCT", 25)
+SL_BUFFER = 0.015
+TP1_PCT = 0.18
+TP2_PCT = 0.25
+
+MAX_DISCOVERED_TOKENS = 150
+
+# قناة الإشارات + Telethon
+TG_API_ID = os.getenv("TELEGRAM_API_ID", "").strip()
+TG_API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
+TG_SESSION = os.getenv("TELETHON_SESSION", "").strip()
+SIGNAL_CHANNEL = os.getenv("SIGNAL_CHANNEL", "solhousesignal").strip().lstrip("@").replace("https://t.me/", "")
+SIGNAL_MESSAGE_LIMIT = max(5, int(_env_float("SIGNAL_MESSAGE_LIMIT", 60)))
+MANUAL_TTL_HOURS = _env_float("MANUAL_TTL_HOURS", 12)
+MANUAL_MAX = 60
+SIGNAL_PAGES = max(1, int(_env_float("SIGNAL_PAGES", 2)))            # صفحات HTTP، كل صفحة ≈ 20 رسالة
+SIGNAL_HTTP_MIRRORS = [
+    t.strip() for t in os.getenv(
+        "SIGNAL_HTTP_MIRRORS",
+        "https://t.me/s/{ch},https://telegram.me/s/{ch},https://tx.me/s/{ch}",
+    ).split(",") if "{ch}" in t
+]
+WEB_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml",
+    "Accept-Language": "en-US,en;q=0.8",
+    "Cache-Control": "no-cache",
+}
+SIGNAL_MAX_AGE_HOURS = _env_float("SIGNAL_MAX_AGE_HOURS", 24)
+MAX_SECURITY_CHECKS = int(_env_float("MAX_SECURITY_CHECKS", 30))
+MAX_CANDLE_FETCH = int(_env_float("MAX_CANDLE_FETCH", 8))
+SCAN_BUDGET_SEC = _env_float("SCAN_BUDGET_SEC", 100)
+USER_COOLDOWN_SEC = 15
+SCAN_CACHE_SEC = 20
+RUGCHECK_CACHE_SEC = 600
+KEEPALIVE_SEC = 540
+
+DEX = "https://api.dexscreener.com"
+GECKO = "https://api.geckoterminal.com/api/v2"
+RUGCHECK = "https://api.rugcheck.xyz/v1"
+
+EXCLUDED_MINTS = {
+    "So11111111111111111111111111111111111111112",
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    # عناوين برامج/نظام تظهر أحياناً في الرسائل وليست عملات
+    "11111111111111111111111111111111",
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+}
+
+KIND_LABEL = {
+    "SCALP": "⚡ سكالبيج — Fibonacci Golden Zone",
+    "MOMENTUM": "🚀 زخم Momentum — ركوب الصعود",
+    "HOLD": "🧭 احتفاظ Swing — ساعات إلى أيام",
+}
+KIND_SHORT = {"SCALP": "⚡ سكالبيج", "MOMENTUM": "🚀 زخم", "HOLD": "🧭 احتفاظ"}
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-log = logging.getLogger("solana-scan-bot")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("solalpha")
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-PORT = int(os.environ.get("PORT", "10000"))
-
-HTTP_TIMEOUT = aiohttp.ClientTimeout(total=12)
-SOLANA_MINT_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
-
-DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{address}"
-DEXSCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search?q={address}"
-RUGCHECK_SUMMARY_URL = "https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
-RUGCHECK_FULL_URL = "https://api.rugcheck.xyz/v1/tokens/{mint}/report"
-PUMPFUN_URL = "https://frontend-api.pump.fun/coins/{mint}"
-
-GECKOTERMINAL_TOKEN_URL = "https://api.geckoterminal.com/api/v2/networks/solana/tokens/{address}"
-GECKOTERMINAL_POOLS_URL = "https://api.geckoterminal.com/api/v2/networks/solana/tokens/{address}/pools?page=1"
-GECKOTERMINAL_OHLCV_5M_URL = (
-    "https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool}/ohlcv/minute"
-    "?aggregate=5&limit=96&currency=usd"  # ~8 ساعات بشموع 5 دقائق
-)
-GECKOTERMINAL_OHLCV_1M_URL = (
-    "https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool}/ohlcv/minute"
-    "?aggregate=1&limit=180&currency=usd"  # ~3 ساعات بشموع دقيقة واحدة (احتياطي)
-)
-
-NA = "غير متوفر"
-
-# حد "التركيز الخطير" في أكبر 10 محافظ — نفس الرقم المستعمل في عرض الشارة
-# الحمراء بالتقرير (🔴 تجميع خطير)، حتى ما يصيرش تناقض بين التحذير المعروض
-# والتقييم الرقمي (هذا بالضبط كان سبب فشل صفقة QBTC: 34.3% ظهرت "خطيرة"
-# في العرض لكن حسابات النقاط كانت متساهلة معها لين 40%).
-TOP10_DANGER_PCT = 25
-# فوق هذا الرقم، التركيز يُعتبر متطرف ويُمنع مطلقاً بغض النظر عن الزخم -
-# محفظة وحدة أو اثنتين تملك أكثر من نصف العرض، خطر تفريغ فوري حقيقي جداً.
-TOP10_EXTREME_PCT = 50
-# تحت هذا الرقم، السيولة حرجة لدرجة إن التنفيذ الحقيقي شبه مستحيل (انزلاق
-# كامل أو بركة فارغة عملياً)، بغض النظر عن أي إشارة إيجابية أخرى.
-MIN_VIABLE_LIQUIDITY = 1000
-
-# عتبة "ممتازة" في التوصية النهائية
-EXCELLENT_SCORE = 75
-# السكالبينغ يُعرض فقط للعملات "ممتازة" فعلاً - لا لأي عملة فوق حد أدنى منفصل
-# ومنخفض، لأن هذا كان يسمح بإظهار خطة دخول كاملة لعملة توصيتها "منطقة مخاطرة"
-# في نفس الوقت (تناقض مباشر رآه المستخدم في صفقة حقيقية).
-SCALP_MIN_SCORE = EXCELLENT_SCORE
+# ───────────────────────────── أدوات مساعدة ─────────────────────────────
 
 
-# ------------------------------------------------------------------------- #
-#  خادم Health Check (مطلوب لـ Render باش يبقى البوت شغال H24)
-# ------------------------------------------------------------------------- #
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):  # noqa: N802 - اسم الدالة مفروض من http.server
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"OK - Solana Scan Bot is alive")
-
-    def log_message(self, fmt, *args):  # تعطيل سجلات HTTP المزعجة
-        return
+def to_float(v: Any, default: float = 0.0) -> float:
+    if v is None or isinstance(v, bool):
+        return default
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(f) or math.isinf(f):
+        return default
+    return f
 
 
-def run_health_server(port: int) -> None:
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    log.info("Health check server listening on port %s", port)
-    server.serve_forever()
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
 
-# ------------------------------------------------------------------------- #
-#  أدوات مساعدة عامة
-# ------------------------------------------------------------------------- #
+def fmt_usd(v: float) -> str:
+    if v >= 1e9:
+        return f"${v / 1e9:.2f}B"
+    if v >= 1e6:
+        return f"${v / 1e6:.2f}M"
+    if v >= 1e3:
+        return f"${v / 1e3:.1f}K"
+    return f"${v:,.0f}"
 
-_MISSING = object()
+
+def fmt_price(p: float) -> str:
+    if p <= 0:
+        return "0"
+    decimals = max(2, -int(math.floor(math.log10(p))) + 3)
+    return f"{p:.{decimals}f}"
 
 
-def safe_get(d: Any, *keys, default=None):
-    """يمشي داخل dict/list متداخلة بدون ما يطيح الكود إذا مفتاح ناقص.
+API_STATUS: dict = {}   # host -> (آخر حالة، وقتها) — يظهر في /diag وفي رسائل الفشل
 
-    يفرّق بين "المفتاح غير موجود" (يرجّع default) و"المفتاح موجود وقيمته null"
-    (يرجّع None فعلاً) - مهم جداً لأن RugCheck يستعمل null بمعنى "الصلاحية ملغاة = آمن".
-    """
-    cur = d
-    for k in keys:
-        if cur is None:
-            return default
+
+def _note_api(url: str, status: str) -> None:
+    try:
+        API_STATUS[url.split("/")[2]] = (status, time.time())
+    except IndexError:
+        pass
+
+
+def api_status_text() -> str:
+    names = {"api.dexscreener.com": "DexScreener", "api.geckoterminal.com": "GeckoTerminal", "api.rugcheck.xyz": "RugCheck"}
+    lines = []
+    for host, name in names.items():
+        st = API_STATUS.get(host)
+        if st:
+            lines.append(f"• {name}: {st[0]} (قبل {int(time.time() - st[1])}ث)")
+    return "\n".join(lines) if lines else "• لا توجد معلومات عن حالة المصادر بعد"
+
+
+async def fetch_json(
+    client: httpx.AsyncClient,
+    url: str,
+    params: Optional[dict] = None,
+    headers: Optional[dict] = None,
+    retries: int = 1,
+) -> Any:
+    for attempt in range(retries + 1):
         try:
-            cur = cur[k]
-        except (KeyError, IndexError, TypeError):
-            return default
-    return cur
-
-
-def fmt_usd(n: Optional[float]) -> str:
-    if n is None:
-        return NA
-    try:
-        n = float(n)
-    except (TypeError, ValueError):
-        return NA
-    if n >= 1_000_000:
-        return f"${n / 1_000_000:.2f}M"
-    if n >= 1_000:
-        return f"${n / 1_000:.1f}K"
-    return f"${n:,.2f}"
-
-
-def fmt_price(n: Optional[float]) -> str:
-    if n is None:
-        return NA
-    try:
-        n = float(n)
-    except (TypeError, ValueError):
-        return NA
-    if n == 0:
-        return "$0"
-    if n >= 1:
-        return f"${n:,.4f}"
-    # عدد كافٍ من الخانات العشرية للأسعار الصغيرة جداً (شائع في عملات الميم)
-    decimals = max(4, -int(f"{n:.1e}".split("e")[1]) + 3)
-    return f"${n:.{min(decimals, 14)}f}"
-
-
-def fmt_pct(n: Optional[float], signed: bool = False) -> str:
-    if n is None:
-        return NA
-    try:
-        n = float(n)
-    except (TypeError, ValueError):
-        return NA
-    sign = "+" if (signed and n >= 0) else ""
-    return f"{sign}{n:.1f}%"
-
-
-def to_float(x: Any) -> Optional[float]:
-    """تحويل آمن لأي قيمة رقمية قادمة من API خارجي.
-
-    مهم جداً لـ GeckoTerminal تحديداً: يرجّع أغلب حقوله الرقمية كـ *نصوص*
-    (مثلاً "45203.12" بدل 45203.12) حسب مواصفة JSON:API اللي يتبعها، وأي
-    عملية حسابية أو مقارنة مباشرة على نص كهذا تطيح البوت بخطأ TypeError.
-    """
-    if x is None:
-        return None
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return None
-
-
-def age_from_ms(ms: Optional[int]) -> str:
-    if not ms:
-        return NA
-    try:
-        seconds = max(0, time.time() - (ms / 1000))
-    except (TypeError, ValueError):
-        return NA
-    if seconds < 3600:
-        return f"{int(seconds // 60)} دقيقة"
-    if seconds < 86400:
-        return f"{int(seconds // 3600)} ساعة"
-    return f"{int(seconds // 86400)} يوم"
-
-
-# ------------------------------------------------------------------------- #
-#  طلبات الـ APIs الخارجية (كل واحدة معزولة، فشل وحدة ما يوقفش الباقي)
-# ------------------------------------------------------------------------- #
-
-async def fetch_json(session: aiohttp.ClientSession, url: str) -> Optional[dict]:
-    try:
-        async with session.get(url, timeout=HTTP_TIMEOUT) as resp:
-            if resp.status != 200:
-                log.warning("GET %s -> HTTP %s", url, resp.status)
+            r = await client.get(url, params=params, headers=headers)
+            _note_api(url, f"HTTP {r.status_code}")
+            if r.status_code == 429:
+                await asyncio.sleep(1.2 * (attempt + 1))
+                continue
+            if r.status_code != 200:
+                log.warning("HTTP %s from %s", r.status_code, url)
                 return None
-            return await resp.json(content_type=None)
-    except asyncio.TimeoutError:
-        log.warning("Timeout fetching %s", url)
-        return None
-    except (aiohttp.ClientError, ValueError) as exc:
-        log.warning("Error fetching %s: %s", url, exc)
-        return None
-
-
-def _best_liquidity_pair(pairs: list) -> Optional[dict]:
-    if not pairs:
-        return None
-    return max(pairs, key=lambda p: safe_get(p, "liquidity", "usd", default=0) or 0)
-
-
-async def fetch_dexscreener(session: aiohttp.ClientSession, address: str) -> Optional[dict]:
-    """يقبل Token Mint Address أو Pair/Pool Address بلا تفريق.
-
-    يجرّب أولاً مسار /tokens/{address} (الحالة الشائعة: عنوان العملة نفسها).
-    إذا رجع فاضي (مثلاً المستخدم أدخل عنوان البركة/الـ Pair مباشرة، أو العملة
-    جد جديدة وما تأشّرتش بعد كـ"token"), يجرّب مسار /search?q=address اللي
-    يغطي الحالتين.
-    """
-    data = await fetch_json(session, DEXSCREENER_TOKEN_URL.format(address=address))
-    pairs = safe_get(data, "pairs", default=None)
-    best = _best_liquidity_pair(pairs)
-    if best:
-        return best
-
-    data2 = await fetch_json(session, DEXSCREENER_SEARCH_URL.format(address=address))
-    pairs2 = safe_get(data2, "pairs", default=None)
-    return _best_liquidity_pair(pairs2)
-
-
-async def fetch_rugcheck(session: aiohttp.ClientSession, mint: str) -> dict:
-    """يحاول يجيب التقرير الكامل، وإذا فشل يرجع للملخص. يرجّع dict فاضي عند الفشل الكامل."""
-    full = await fetch_json(session, RUGCHECK_FULL_URL.format(mint=mint))
-    if full:
-        return full
-    summary = await fetch_json(session, RUGCHECK_SUMMARY_URL.format(mint=mint))
-    return summary or {}
-
-
-async def fetch_pumpfun(session: aiohttp.ClientSession, mint: str) -> Optional[dict]:
-    return await fetch_json(session, PUMPFUN_URL.format(mint=mint))
-
-
-async def fetch_geckoterminal(session: aiohttp.ClientSession, address: str) -> Optional[dict]:
-    """مصدر احتياطي: يُستدعى فقط إذا DexScreener ما رجّعش حاجة (عملة جد جديدة عادة).
-
-    يرجّع dict بنفس "شكل" بركة DexScreener (نفس المفاتيح المستعملة لاحقاً في
-    analyze_momentum/analyze_origin) حتى يبقى باقي الكود بلا تغيير.
-    """
-    token_data = await fetch_json(session, GECKOTERMINAL_TOKEN_URL.format(address=address))
-    pools_data = await fetch_json(session, GECKOTERMINAL_POOLS_URL.format(address=address))
-
-    token_attrs = safe_get(token_data, "data", "attributes", default={}) or {}
-    pools = safe_get(pools_data, "data", default=[]) or []
-    if not token_attrs and not pools:
-        return None
-
-    best_pool = None
-    if pools:
-        best_pool = max(
-            pools,
-            key=lambda p: float(safe_get(p, "attributes", "reserve_in_usd", default=0) or 0),
-        )
-    pa = safe_get(best_pool, "attributes", default={}) or {}
-
-    pair_created_ms = None
-    created_iso = pa.get("pool_created_at")
-    if created_iso:
-        try:
-            dt = datetime.fromisoformat(str(created_iso).replace("Z", "+00:00"))
-            pair_created_ms = dt.timestamp() * 1000
+            return r.json()
         except ValueError:
-            pair_created_ms = None
-
-    pool_address = safe_get(best_pool, "attributes", "address", default=None)
-
-    return {
-        "_source_api": "geckoterminal",
-        "dexId": "geckoterminal",
-        "pairAddress": pool_address,
-        "baseToken": {
-            "name": token_attrs.get("name"),
-            "symbol": token_attrs.get("symbol"),
-            "address": address,
-        },
-        "priceUsd": token_attrs.get("price_usd") or pa.get("base_token_price_usd"),
-        "marketCap": token_attrs.get("market_cap_usd"),
-        "fdv": token_attrs.get("fdv_usd"),
-        "liquidity": {"usd": pa.get("reserve_in_usd")},
-        "volume": {
-            "m5": safe_get(pa, "volume_usd", "m5", default=None),
-            "h1": safe_get(pa, "volume_usd", "h1", default=None) or safe_get(pa, "volume_usd", "h24", default=None),
-        },
-        "txns": {
-            "m5": {
-                "buys": safe_get(pa, "transactions", "m5", "buys", default=None),
-                "sells": safe_get(pa, "transactions", "m5", "sells", default=None),
-            }
-        },
-        "priceChange": {
-            "m5": safe_get(pa, "price_change_percentage", "m5", default=None),
-            "h1": safe_get(pa, "price_change_percentage", "h1", default=None),
-        },
-        "pairCreatedAt": pair_created_ms,
-        "url": f"https://www.geckoterminal.com/solana/pools/{pool_address}" if pool_address else None,
-    }
-
-
-# عدد الشموع (قبل القمة) اللي نبحث فيها عن قاع الموجة الأخيرة. نحدّدها
-# حتى ما نلقطش قاع قديم من موجة سابقة ما عادش لها علاقة بالحركة الحالية.
-SWING_LOOKBACK_CANDLES = 20
-
-
-def _parse_ohlcv_rows(data: Optional[dict]) -> list:
-    """يرجّع شموع [ts, open, high, low, close, volume] مرتبة من الأقدم للأحدث."""
-    rows = safe_get(data, "data", "attributes", "ohlcv_list", default=None) or []
-    parsed = []
-    for row in rows:
-        try:
-            parsed.append([float(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])])
-        except (IndexError, TypeError, ValueError):
-            continue
-    parsed.sort(key=lambda r: r[0])  # GeckoTerminal يرجّع الأحدث أولاً عادة؛ نرتبها تصاعدياً
-    return parsed
-
-
-def _find_swing_wave(candles: list) -> Optional[dict]:
-    """يحدد "الموجة الصاعدة الأخيرة" ضمن نافذة الشموع المعطاة:
-
-    - Swing High = أعلى قمة حالية ضمن النافذة (أحدث/أقوى حركة صاعدة).
-    - Swing Low  = أدنى قاع خلال آخر SWING_LOOKBACK_CANDLES شمعة قبل تلك
-      القمة مباشرة (بداية الموجة المؤدية لها)، مو قاع الجلسة كاملة.
-    """
-    if len(candles) < 5:
-        return None
-    highs = [c[2] for c in candles]
-    lows = [c[3] for c in candles]
-
-    high_idx = max(range(len(highs)), key=lambda i: highs[i])
-    swing_high = highs[high_idx]
-
-    window_start = max(0, high_idx - SWING_LOOKBACK_CANDLES)
-    segment = lows[window_start:high_idx + 1]
-    if not segment:
-        return None
-    swing_low = min(segment)
-
-    if swing_high <= swing_low or swing_low <= 0:
-        return None
-    return {"swing_low": swing_low, "swing_high": swing_high}
-
-
-async def fetch_swing_wave(session: aiohttp.ClientSession, pool_address: Optional[str]) -> Optional[dict]:
-    """يجيب "الموجة الصاعدة الأخيرة" (قاع البداية + قمة حالية) من شموع 5 دقائق،
-    وإذا فشلت (بركة جد جديدة بعدد شموع قليل) يرجع لشموع دقيقة واحدة كاحتياط.
-
-    هذا يستبدل منطق "القاع التاريخي على 48 ساعة" القديم، لأن ذاك القاع ممكن
-    يكون بعيد زمنياً وما عادش له علاقة بحركة السعر الحالية - غير مناسب للسكالبينغ.
-    """
-    if not pool_address:
-        return None
-
-    data_5m = await fetch_json(session, GECKOTERMINAL_OHLCV_5M_URL.format(pool=pool_address))
-    candles = _parse_ohlcv_rows(data_5m)
-    wave = _find_swing_wave(candles)
-    if wave:
-        wave["timeframe"] = "5m"
-        return wave
-
-    data_1m = await fetch_json(session, GECKOTERMINAL_OHLCV_1M_URL.format(pool=pool_address))
-    candles_1m = _parse_ohlcv_rows(data_1m)
-    wave = _find_swing_wave(candles_1m)
-    if wave:
-        wave["timeframe"] = "1m"
-        return wave
-
+            _note_api(url, "JSON غير صالح")
+            return None
+        except httpx.HTTPError as e:
+            _note_api(url, type(e).__name__)
+            log.warning("Request failed (%s): %s", url, e)
+            await asyncio.sleep(0.6 * (attempt + 1))
     return None
 
 
-# ------------------------------------------------------------------------- #
-#  التحليل: استخراج كل محور من البيانات الخام
-# ------------------------------------------------------------------------- #
+# ───────────────────────────── اكتشاف العملات (من قناة الإشارات) ─────────────────────────────
 
-def analyze_origin(dex: Optional[dict], pump: Optional[dict]) -> dict:
-    source = NA
-    if dex and safe_get(dex, "_source_api", default="") == "geckoterminal":
-        source = "GeckoTerminal (احتياطي)"
-    elif dex:
-        dex_id = safe_get(dex, "dexId", default="")
-        if dex_id:
-            source = {
-                "raydium": "Raydium",
-                "pumpfun": "Pump.fun",
-                "pumpswap": "Pump.fun (PumpSwap)",
-                "orca": "Orca",
-                "meteora": "Meteora",
-            }.get(str(dex_id).lower(), str(dex_id).title())
-    if pump is not None and source in (NA, ""):
-        source = "Pump.fun" if not safe_get(pump, "complete", default=True) else "Pump.fun → Raydium"
-    migrated = None
-    if pump is not None:
-        migrated = bool(safe_get(pump, "complete", default=False))
-    return {"source": source, "migrated": migrated}
+B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+B58_INDEX = {ch: i for i, ch in enumerate(B58_ALPHABET)}
+
+# عنوان Solana = Base58 بطول 32–44 حرفاً (والتحقق النهائي أنه يفك إلى 32 بايت)
+SOL_ADDR_RE = re.compile(r"(?<![1-9A-HJ-NP-Za-km-z])[1-9A-HJ-NP-Za-km-z]{32,44}(?![1-9A-HJ-NP-Za-km-z])")
+# روابط DexScreener تحمل عنوان "الزوج" لا العملة → نحلّه لاحقاً عبر endpoint الأزواج
+DEX_PAIR_URL_RE = re.compile(r"(?i:dexscreener\.com)/solana/([1-9A-HJ-NP-Za-km-z]{32,44})")
+# روابط المحافظ/الحسابات ليست عقود عملات
+EXPLORER_URL_RE = re.compile(r"(?i:solscan\.io|solana\.fm|explorer\.solana\.com)/(?:account|address)/\S+")
 
 
-def analyze_dev(rug: dict, pump: Optional[dict]) -> dict:
-    creator = safe_get(rug, "creator", default=None) or safe_get(rug, "creatorAddress", default=None)
-    if not creator and pump is not None:
-        creator = safe_get(pump, "creator", default=None)
 
-    top_holders = safe_get(rug, "topHolders", default=None) or safe_get(rug, "holders", default=None) or []
-    dev_pct = None
-    dev_sold = None
-    if creator and isinstance(top_holders, list):
-        match = next(
-            (h for h in top_holders if str(safe_get(h, "address", default="")).lower() == str(creator).lower()),
-            None,
-        )
-        if match:
-            dev_pct = to_float(safe_get(match, "pct", default=None))
-            dev_sold = False
-        else:
-            # المطوّر ظهر كـ creator لكن ما عادش ضمن كبار الحاملين = غالباً باع
-            dev_sold = True
-            dev_pct = 0.0
-
-    # تاريخ المطوّر (عملات سابقة) - RugCheck أحياناً يعطيه ضمن "risks" أو "creatorTokens"
-    prior_rugs = None
-    risks = safe_get(rug, "risks", default=[]) or []
-    for r in risks:
-        name = str(safe_get(r, "name", default="")).lower()
-        if "creator" in name or "previous" in name or "history" in name:
-            prior_rugs = safe_get(r, "description", default=NA)
-            break
-
-    return {
-        "address": creator or NA,
-        "dev_pct": dev_pct,
-        "dev_sold": dev_sold,
-        "history_note": prior_rugs,
-    }
+@dataclass
+class Signal:
+    mint: str                       # عنوان العملة (أو عنوان زوج إذا is_hint)
+    post_id: int
+    ts: Optional[float]             # وقت نشر الرسالة (epoch ثوانٍ)
+    is_hint: bool = False           # جاء من رابط DexScreener (قد يكون عنوان زوج)
+    manual: bool = False            # أرسله المستخدم يدوياً (لصق/Forward)
+    added: float = 0.0              # وقت استلام البوت له (للوضع اليدوي)
+    done: bool = False              # حُلِّل سابقاً (لا يُعاد تحليله إلا بـ /best all)
 
 
-def analyze_holders(rug: dict) -> dict:
-    top_holders = safe_get(rug, "topHolders", default=None) or safe_get(rug, "holders", default=None) or []
-    top10_pct = None
-    if isinstance(top_holders, list) and top_holders:
-        try:
-            top10_pct = sum(float(safe_get(h, "pct", default=0) or 0) for h in top_holders[:10])
-        except (TypeError, ValueError):
-            top10_pct = None
-
-    snipers_note = NA
-    bundled = None
-    risks = safe_get(rug, "risks", default=[]) or []
-    for r in risks:
-        name = str(safe_get(r, "name", default="")).lower()
-        if "snip" in name or "bundle" in name:
-            bundled = True
-            snipers_note = safe_get(r, "description", default="تم رصد قناصة/حزمة شراء بالبلوك الأول")
-            break
-    if bundled is None:
-        bundled = False
-        snipers_note = "لم يُرصد نمط قنص واضح في البيانات المتاحة"
-
-    return {"top10_pct": top10_pct, "bundled": bundled, "snipers_note": snipers_note}
+def is_valid_solana_address(s: str) -> bool:
+    n = 0
+    for ch in s:
+        v = B58_INDEX.get(ch)
+        if v is None:
+            return False
+        n = n * 58 + v
+    pad = len(s) - len(s.lstrip("1"))
+    return pad + (n.bit_length() + 7) // 8 == 32
 
 
-def analyze_security(rug: dict) -> dict:
-    token = safe_get(rug, "token", default={}) or {}
-    mint_auth = safe_get(token, "mintAuthority", default=_MISSING)
-    if mint_auth is _MISSING:
-        mint_auth = safe_get(rug, "mintAuthority", default=_MISSING)
-    freeze_auth = safe_get(token, "freezeAuthority", default=_MISSING)
-    if freeze_auth is _MISSING:
-        freeze_auth = safe_get(rug, "freezeAuthority", default=_MISSING)
+def extract_addresses(text: str):
+    """يرجع (عناوين_عقود، عناوين_من_روابط_DexScreener) مرتبة وفريدة."""
+    if not text:
+        return [], []
+    hints: list = []
+    for a in DEX_PAIR_URL_RE.findall(text):
+        if a not in hints and a not in EXCLUDED_MINTS and is_valid_solana_address(a):
+            hints.append(a)
+    cleaned = EXPLORER_URL_RE.sub(" ", DEX_PAIR_URL_RE.sub(" ", text))
+    mints: list = []
+    for a in SOL_ADDR_RE.findall(cleaned):
+        if a not in mints and a not in EXCLUDED_MINTS and is_valid_solana_address(a):
+            mints.append(a)
+    return mints, hints
 
-    mint_disabled = None if mint_auth is _MISSING else (mint_auth in (None, "", "null"))
-    freeze_disabled = None if freeze_auth is _MISSING else (freeze_auth in (None, "", "null"))
 
-    markets = safe_get(rug, "markets", default=[]) or []
-    lp_locked_pct = None
-    if markets:
-        vals = [
-            safe_get(m, "lp", "lpLockedPct", default=None)
-            for m in markets
-            if safe_get(m, "lp", "lpLockedPct", default=None) is not None
-        ]
-        if vals:
+def fmt_age(minutes: float) -> str:
+    if minutes < 1:
+        return "الآن"
+    if minutes < 60:
+        return f"منذ {int(minutes)} دقيقة"
+    if minutes < 1440:
+        return f"منذ {minutes / 60:.1f} ساعة"
+    return f"منذ {minutes / 1440:.1f} يوم"
+
+
+_POST_RE = re.compile(r'data-post="([^"]+)"')
+_TEXT_RE = re.compile(r'<div class="tgme_widget_message_text js-message_text[^"]*"[^>]*>(.*?)</div>', re.S)
+_PREVIEW_RE = re.compile(r'<a[^>]*tgme_widget_message_link_preview[^>]*href="([^"]+)"')
+_TIME_RE = re.compile(r'<time[^>]*datetime="([^"]+)"')
+_ANCHOR_RE = re.compile(r'<a\s[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.S)
+
+
+def _html_to_text(fragment: str) -> str:
+    s = _ANCHOR_RE.sub(lambda m: f" {m.group(1)} {m.group(2)} ", fragment)  # نُبقي قيمة href
+    s = re.sub(r"<br\s*/?>", "\n", s)
+    s = re.sub(r"<[^>]+>", " ", s)
+    return html.unescape(s)
+
+
+def parse_channel_html(page: str) -> list:
+    """يحلل صفحة معاينة القناة (…/s/<channel>) → [{id, ts, text}]."""
+    matches = list(_POST_RE.finditer(page))
+    out = []
+    for i, mt in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(page)
+        chunk = page[mt.start():end]
+        chan, _, pid = mt.group(1).partition("/")
+        if chan.lower() != SIGNAL_CHANNEL.lower() or not pid.isdigit():
+            continue
+        parts = [_html_to_text(t) for t in _TEXT_RE.findall(chunk)]
+        parts += [html.unescape(u) for u in _PREVIEW_RE.findall(chunk)]
+        ts = None
+        tm = _TIME_RE.search(chunk)
+        if tm:
             try:
-                lp_locked_pct = sum(float(v) for v in vals) / len(vals)
-            except (TypeError, ValueError):
-                lp_locked_pct = None
-
-    score_raw = safe_get(rug, "score_normalised", default=None)
-    if score_raw is None:
-        score_raw = safe_get(rug, "score", default=None)
-
-    return {
-        "mint_disabled": mint_disabled,
-        "freeze_disabled": freeze_disabled,
-        "lp_locked_pct": lp_locked_pct,
-        "rugcheck_score": score_raw,
-    }
+                ts = datetime.fromisoformat(tm.group(1).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                ts = None
+        out.append({"id": int(pid), "ts": ts, "text": "\n".join(parts)})
+    return out
 
 
-def analyze_momentum(dex: Optional[dict]) -> dict:
-    if not dex:
-        return {
-            "vol_5m": None, "vol_1h": None, "liq_usd": None, "mcap": None,
-            "buys_5m": None, "sells_5m": None, "change_5m": None, "change_1h": None,
-            "price": None, "pair_age_ms": None, "pair_address": None,
-        }
-    buys_5m = to_float(safe_get(dex, "txns", "m5", "buys", default=None))
-    sells_5m = to_float(safe_get(dex, "txns", "m5", "sells", default=None))
-    return {
-        "vol_5m": to_float(safe_get(dex, "volume", "m5", default=None)),
-        "vol_1h": to_float(safe_get(dex, "volume", "h1", default=None)),
-        "liq_usd": to_float(safe_get(dex, "liquidity", "usd", default=None)),
-        "mcap": to_float(safe_get(dex, "marketCap", default=None)) or to_float(safe_get(dex, "fdv", default=None)),
-        # نحافظ على القيم الصحيحة (int) لعدد العمليات بدل float لعرض أجمل (40 لا 40.0)
-        "buys_5m": int(buys_5m) if buys_5m is not None else None,
-        "sells_5m": int(sells_5m) if sells_5m is not None else None,
-        "change_5m": to_float(safe_get(dex, "priceChange", "m5", default=None)),
-        "change_1h": to_float(safe_get(dex, "priceChange", "h1", default=None)),
-        "price": to_float(safe_get(dex, "priceUsd", default=None)),
-        "pair_age_ms": to_float(safe_get(dex, "pairCreatedAt", default=None)),
-        "pair_address": safe_get(dex, "pairAddress", default=None),
-    }
+TL: dict = {"client": None, "error": None}   # حالة عميل Telethon (يُهيّأ في post_init)
 
 
-# ------------------------------------------------------------------------- #
-#  الخوارزمية: تقييم من 100
-# ------------------------------------------------------------------------- #
-
-def compute_score(security: dict, holders: dict, momentum: dict, dev: dict) -> dict:
-    """يحسب تقييماً من 100 + قائمة أسباب مرتبة حسب الخطورة الفعلية.
-
-    ثغرة حقيقية انصلحت هنا: الأسباب قبل كانت تترتب حسب ترتيب الفحوصات في
-    الكود (أمان ثم توزيع ثم حجم...)، مو حسب أهمية الخطر الفعلي. شفنا عملياً
-    عملة تنهار -65% خلال 5 دقائق لكن "السبب الرئيسي" المعروض كان عن نسبة
-    قفل سيولة بسيطة، لأنه فحص الأمان ينفّذ أولاً في الكود. دابا كل سبب له
-    أولوية (severity)، والأسباب تترتب تنازلياً قبل اختيار "السبب الرئيسي".
-    """
-    score = 0.0
-    reasons = []  # كل عنصر: (severity, text) — severity أعلى = أخطر = يظهر أول
-
-    def add_reason(severity: int, text: str) -> None:
-        reasons.append((severity, text))
-
-    # 1) الأمان: 40 نقطة
-    sec_pts = 0.0
-    if security["mint_disabled"] is True:
-        sec_pts += 12
-    elif security["mint_disabled"] is False:
-        add_reason(95, "صلاحية السك مفعّلة (خطر تضخيم العرض)")
-    if security["freeze_disabled"] is True:
-        sec_pts += 12
-    elif security["freeze_disabled"] is False:
-        add_reason(95, "صلاحية التجميد مفعّلة (خطر منع البيع)")
-    lp = security["lp_locked_pct"]
-    if lp is not None:
-        sec_pts += min(16, (lp / 100) * 16)
-        if lp < 50:
-            add_reason(20, "نسبة قفل/حرق السيولة منخفضة")
-    score += sec_pts
-
-    # 2) توزيع الحاملين: 25 نقطة
-    # ملاحظة مهمة: التركيز وحده ما يكفيش يحدد الخطر. شفنا عملياً عملة بتركيز
-    # 32.2% (فوق حد الأمان 25%) طارت +150% لأن الزخم كان قوي وحقيقي (شراء
-    # متواصل وحجم عالي)، وعملة تانية بتركيز 55% انهارت لأنها كانت أصلاً في
-    # موجة بيع. فالمنع الصريح دابا يتفعّل تلقائياً فقط للتركيز المتطرف جداً
-    # (فوق TOP10_EXTREME_PCT)، أما التركيز المتوسط (25-50%) فيتحول لـ"حذر"
-    # يسمح بخطة مصغّرة فقط إذا الزخم فعلاً قوي ومؤكد (strong_momentum تحت).
-    dist_pts = 0.0
-    t10 = holders["top10_pct"]
-    concentration_extreme = False
-    concentration_caution = False
-    if t10 is not None:
-        if t10 <= 15:
-            dist_pts += 18
-        elif t10 <= TOP10_DANGER_PCT:
-            dist_pts += 11
-        elif t10 <= 35:
-            dist_pts += 2
-            concentration_caution = True
-            add_reason(70, f"تركيز مرتفع في أكبر 10 محافظ ({t10:.1f}%، فوق حد الأمان {TOP10_DANGER_PCT}%)")
-        elif t10 <= TOP10_EXTREME_PCT:
-            dist_pts += 0
-            concentration_caution = True
-            add_reason(80, f"تركيز مرتفع جداً في أكبر 10 محافظ ({t10:.1f}%)")
-        else:
-            concentration_extreme = True
-            add_reason(98, f"تجميع متطرف وخطير في أكبر 10 محافظ ({t10:.1f}%، فوق {TOP10_EXTREME_PCT}%)")
-    if holders["bundled"] is False:
-        dist_pts += 7
-    elif holders["bundled"] is True:
-        add_reason(90, "رُصد نمط قنص/حزمة شراء بالبلوك الأول")
-    if dev.get("dev_sold") is True:
-        dist_pts += 0  # المطور باع: لا عقوبة إضافية هنا (أحياناً إيجابي)، لكن ينذكر في التقرير
-    elif dev.get("dev_sold") is False and (dev.get("dev_pct") or 0) > 15:
-        add_reason(50, "المطوّر لا يزال يملك نسبة كبيرة من العرض")
-    score += dist_pts
-
-    # 3) الحجم ونسبة الشراء/البيع: 20 نقطة
-    vol_pts = 0.0
-    liq_usd_raw = momentum["liq_usd"]  # نحتفظ بالقيمة الخام (ممكن None أو 0.0 فعلياً) لفحص السيولة الحرجة تحت
-    liq = liq_usd_raw or 0
-    vol5 = momentum["vol_5m"]
-    buys, sells = momentum["buys_5m"], momentum["sells_5m"]
-    if liq and vol5 is not None:
-        ratio = vol5 / liq if liq else 0
-        if 0.05 <= ratio <= 3:
-            vol_pts += 10
-        elif ratio > 3:
-            add_reason(30, "حجم التداول ضخم جداً مقابل السيولة (قد يكون مصطنعاً)")
-    if buys is not None and sells is not None:
-        total_tx = buys + sells
-        if total_tx >= 20:
-            bratio = buys / max(sells, 1)
-            if bratio >= 1.2:
-                vol_pts += 10
-            elif bratio >= 0.8:
-                vol_pts += 5
-            else:
-                add_reason(35, "البيع يفوق الشراء في آخر 5 دقائق")
-        else:
-            add_reason(15, "عدد صفقات قليل جداً آخر 5 دقائق")
-    score += vol_pts
-
-    # 4) كفاية السيولة: 15 نقطة
-    liq_pts = 0.0
-    if liq:
-        if liq >= 50_000:
-            liq_pts += 15
-        elif liq >= 15_000:
-            liq_pts += 9
-        elif liq >= 5_000:
-            liq_pts += 4
-            add_reason(40, "سيولة منخفضة، انزلاق سعري متوقع")
-        else:
-            add_reason(60, "سيولة ضعيفة جداً، خطر مرتفع")
-    score += liq_pts
-
-    # 5) تأكيد الاتجاه (Trend Confirmation): عقوبة صريحة إذا السعر فعلاً هابط
-    # بقوة رغم أن باقي المحاور (أمان/توزيع/سيولة) تبان جيدة. هذا كان ثغرة
-    # حقيقية: عملة ممكن تكون "نظيفة" من ناحية العقد لكنها أصلاً في موجة هبوط،
-    # وبلا هذا الفحص كانت تاخذ تقييم عالي رغم إنها فعلياً "تروقة" سعرية جارية.
-    change_1h = momentum.get("change_1h")
-    change_5m = momentum.get("change_5m")
-    crashing_now = False
-    if change_1h is not None:
-        if change_1h <= -25:
-            score -= 15
-            crashing_now = True
-            add_reason(85, "هبوط حاد جداً آخر ساعة، الموجة غالباً انتهت أو العملة تنهار")
-        elif change_1h <= -10:
-            score -= 7
-            add_reason(45, "ضعف واضح في السعر آخر ساعة")
-    # انهيار فوري خلال آخر 5 دقائق فقط - أخطر إشارة ممكنة لأنها تعني العملة
-    # تنهار الآن بالضبط، وقت التقرير نفسه، مو موجة ضعف تدريجية.
-    if change_5m is not None:
-        if change_5m <= -30:
-            score -= 20
-            crashing_now = True
-            add_reason(99, f"انهيار سعري حاد جداً خلال آخر 5 دقائق ({change_5m:.1f}%) - العملة تنهار الآن")
-        elif change_1h is not None and change_1h > 0 and change_5m <= -8:
-            # الاتجاه العام صاعد لكن آخر 5 دقايق فيها انعكاس بيع قوي = إشارة خروج مبكرة
-            score -= 5
-            add_reason(55, "انعكاس بيع قصير المدى رغم الاتجاه الصاعد العام")
-
-    # 6) مكافأة الزخم القوي (Momentum Strength Bonus): زخم شرائي حقيقي ومستمر
-    # (مو قفزة لحظية وحدة) هو أقوى إشارة فعلية على اهتمام عضوي متواصل. هذا
-    # الشرط بالضبط هو اللي ميّز عملة "Jef" (طارت +150%) عن عملة "Butt" (انهارت):
-    # كلاهما تركيز حاملين مرتفع، لكن واحدة زخمها قوي صاعد والثانية كانت تنهار.
-    #
-    # ثغرة حقيقية انصلحت هنا: عملة "Pump Museum" كان عندها change_1h=+91%
-    # (يجتاز الشرط القديم) لكن انهارت -89% بعدها، لأن حجم التداول كان فعلياً
-    # ميت (1.5K آخر 5 دقايق مقابل 83.4K متوسط الساعة = الموجة خلصت والزخم
-    # كان أثر قديم من قمة سابقة، مو شراء مستمر). عملة "Jef" الناجحة كان عندها
-    # حجم 5 دقايق أعلى من المعدل الساعي بـ5 أضعاف - زخم حقيقي متواصل فعلاً.
-    # فحص "نبض الحجم" (Volume Pace) هذا ضروري، مو السعر والنسبة لوحدهم.
-    vol1h = momentum.get("vol_1h")
-    vol_pace_ratio = None
-    if vol5 is not None and vol1h is not None and vol1h > 0:
-        vol_pace_ratio = (vol5 * 12) / vol1h  # نسبة معدل آخر 5 دقايق لمعدل الساعة الكامل
-    pace_sustained = vol_pace_ratio is not None and vol_pace_ratio >= 1.0
-    if vol_pace_ratio is not None and vol_pace_ratio < 0.4:
-        add_reason(65, "حجم التداول يتباطأ بقوة مقارنة بمتوسط الساعة (الموجة غالباً خلصت)")
-
-    buys_ok = buys is not None and sells is not None and (buys + sells) >= 20
-    bratio_strong = buys_ok and (buys / max(sells, 1)) >= 1.1
-    strong_momentum = bool(
-        change_1h is not None and change_1h >= 50
-        and change_5m is not None and change_5m > 0
-        and bratio_strong
-        and pace_sustained
-    )
-    if strong_momentum:
-        score += 8
-        add_reason(5, "زخم شرائي قوي ومستمر مع حجم متصاعد (إشارة إيجابية)")
-
-    total = round(min(100, max(0, score)))
-
-    # ثغرة ثانية انصلحت: عملة "paper-chan" عندها سيولة مُبلّغة = $0.00 حرفياً
-    # (مو مفقودة، بل صفر فعلي من GeckoTerminal)، وهذا يعني عملياً إنه ما
-    # يمكنش تنفيذ صفقة حقيقية فيها (انزلاق كامل أو بركة شبه فارغة). هذا خطر
-    # تنفيذي أساسي، لازم يمنع مطلقاً بغض النظر عن الزخم أو التقييم.
-    liquidity_critical = liq_usd_raw is not None and liq_usd_raw < MIN_VIABLE_LIQUIDITY
-
-    # hard_block: مانع صريح مطلق لخطة السكالبينغ، بغض النظر عن التقييم أو
-    # الزخم - هذي مخاطر "صفرية التسامح" (نصب كامل، سيولة غير قابلة للتنفيذ،
-    # أو انهيار مؤكد الآن).
-    mint_or_freeze_danger = security.get("mint_disabled") is False or security.get("freeze_disabled") is False
-    hard_block = (
-        concentration_extreme or (holders.get("bundled") is True) or crashing_now
-        or mint_or_freeze_danger or liquidity_critical
-    )
-    if liquidity_critical:
-        add_reason(99, f"سيولة حرجة جداً (${liq_usd_raw:,.0f}) - التنفيذ غير ممكن عملياً")
-
-    # caution_block: تركيز مرتفع (25-50%) بلا زخم قوي يثبت إنه مو خطر وشيك -
-    # ما نمنعش منعاً مطلقاً، لكن ما نعطيش خطة دخول إلا لو الزخم أثبت نفسه.
-    reduced_size = concentration_caution and strong_momentum and not hard_block
-    caution_block = concentration_caution and not strong_momentum and not hard_block
-
-    # التوصية (verdict) لازم تعكس hard_block/caution_block بصراحة، حتى ما
-    # يصيرش تناقض زي اللي صار: "78/100 - فرصة ممتازة" وفي نفس الوقت "لا توجد
-    # خطة دخول" في نفس الرسالة. التوصية دابا مبنية على القرار الفعلي، مو
-    # الرقم الخام بمعزل عن باقي الفحوصات.
-    if hard_block:
-        verdict = "🔴 خطر - لا تشتري!"
-    elif caution_block:
-        verdict = "⚠️ منطقة مخاطرة"
-    elif reduced_size:
-        verdict = "🟡 فرصة بحذر (تركيز مرتفع، الزخم يعوّضه جزئياً)"
-    elif total >= EXCELLENT_SCORE:
-        verdict = "🚀 فرصة سكالپينغ ممتازة"
-    elif total >= 45:
-        verdict = "⚠️ منطقة مخاطرة"
-    else:
-        verdict = "🔴 خطر - لا تشتري!"
-
-    # ترتيب الأسباب تنازلياً حسب الخطورة الفعلية، مو حسب ترتيب الفحوصات بالكود
-    reasons.sort(key=lambda r: -r[0])
-    all_reasons = [text for _, text in reasons]
-    block_reasons = [text for sev, text in reasons if sev >= 85]
-    caution_reasons = [text for sev, text in reasons if 65 <= sev < 85]
-
-    main_reason = all_reasons[0] if all_reasons else "لا توجد ملاحظات حرجة من الفحوصات المتاحة"
-    return {
-        "total": total, "verdict": verdict, "main_reason": main_reason, "all_reasons": all_reasons,
-        "hard_block": hard_block, "block_reasons": block_reasons,
-        "caution_block": caution_block, "caution_reasons": caution_reasons,
-        "reduced_size": reduced_size, "strong_momentum": strong_momentum,
-    }
-
-
-# ------------------------------------------------------------------------- #
-#  محرك السكالبينغ: منطقة الدخول، الأهداف، ووقف الخسارة
-# ------------------------------------------------------------------------- #
-
-# نسبة وقف الخسارة تحت قاع الموجة مباشرة (داخل مجال 1%-2% المطلوب)
-SCALP_SL_BUFFER_PCT = 0.015
-# منطقة الدخول الذهبية: تصحيح فيبوناتشي بين 0.5 و0.618 من الموجة
-FIB_ENTRY_DEEP = 0.618   # الحد الأدنى للمنطقة (تصحيح أعمق)
-FIB_ENTRY_SHALLOW = 0.50  # الحد الأعلى للمنطقة (تصحيح أخف)
-# امتدادات فيبوناتشي للأهداف، مقاسة من قاع الموجة
-FIB_TP1_EXT = 1.272
-FIB_TP2_EXT = 1.618
-
-
-def compute_scalp_plan(price: Optional[float], swing: Optional[dict],
-                        liq_usd: Optional[float], mcap: Optional[float] = None) -> Optional[dict]:
-    """يبني خطة سكالبينغ على Price Action حقيقي لآخر موجة فقط (Recent Swing Wave):
-
-    1. منطقة الدخول = "Golden Zone" — تصحيح فيبوناتشي 0.5-0.618 من قاع الموجة
-       الأخيرة (swing_low) إلى قمتها الحالية (swing_high)، مو من أي قاع تاريخي.
-    2. وقف الخسارة = تحت قاع الموجة مباشرة بـ1.5% (ضمن مجال 1-2% المطلوب).
-    3. الأهداف = امتدادات فيبوناتشي 1.272 و1.618 مقاسة من نفس الموجة، مو
-       نسبة ثابتة بلا علاقة بحجم الحركة الفعلي.
-    4. "حالة المنطقة": هل السعر الآن داخل منطقة الدخول، لسا فوقها (ننتظر
-       تصحيح)، أو كسر تحت الدعم (الإعداد بطل صالح)؟
-
-    إذا ما توفرتش بيانات شموع موثوقة (swing=None)، نرجع لتقدير تقريبي بسيط
-    معلن بوضوح في التقرير (estimated=True) بدل ما نرفض الخطة كلياً.
-    """
-    if not price or price <= 0:
-        return None
-
-    estimated = swing is None
-    if swing:
-        swing_low, swing_high = swing["swing_low"], swing["swing_high"]
-        timeframe = swing.get("timeframe", "5m")
-    else:
-        # احتياطي بسيط: نفترض موجة وهمية حول السعر الحالي حتى يبقى للخطة معنى
-        swing_low, swing_high = price * 0.85, price * 1.05
-        timeframe = NA
-
-    wave = swing_high - swing_low
-    if wave <= 0:
-        return None
-
-    entry_low = swing_high - wave * FIB_ENTRY_DEEP      # تصحيح 0.618 (أعمق)
-    entry_high = swing_high - wave * FIB_ENTRY_SHALLOW  # تصحيح 0.50 (أخف)
-    stop_loss = swing_low * (1 - SCALP_SL_BUFFER_PCT)
-    tp1 = swing_low + wave * FIB_TP1_EXT
-    tp2 = swing_low + wave * FIB_TP2_EXT
-
-    risk = entry_low - stop_loss
-    reward = tp1 - entry_low
-    rr = (reward / risk) if risk > 0 else None
-
-    # حالة منطقة الدخول بالنسبة للسعر الحالي الآن
-    if price < stop_loss:
-        zone_status = "🔴 السعر كسر تحت الدعم — هذا الإعداد بطل صالح، لا تدخل."
-    elif price <= entry_high:
-        zone_status = "🟢 السعر داخل منطقة الدخول حالياً."
-    else:
-        zone_status = "⏳ السعر لسا فوق منطقة الدخول — استنى تصحيح للمنطقة قبل الدخول."
-
-    liq_note = None
-    if liq_usd is not None and liq_usd < 15_000:
-        liq_note = "⚠️ السيولة منخفضة: انزلاق السعر (Slippage) قد يبعدك عن هذه المستويات بالضبط."
-
-    # تحويل لماركت كاب: نفترض عرض متداول ثابت (صحيح طالما Mint Authority ملغاة)
-    supply = None
-    if mcap and price and price > 0:
+async def create_telethon():
+    """يرجع (client, خطأ). يحتاج جلسة مستخدم؛ حسابات البوت ممنوعة من قراءة سجل القنوات."""
+    if not TG_SESSION:
+        return None, "TELETHON_SESSION غير مضبوطة (جلسة البوت لا تقرأ سجل القنوات)"
+    if not (TG_API_ID and TG_API_HASH):
+        return None, "TELEGRAM_API_ID / TELEGRAM_API_HASH غير مضبوطين"
+    try:
+        api_id = int(TG_API_ID)
+    except ValueError:
+        return None, "TELEGRAM_API_ID يجب أن يكون رقماً"
+    client = TelegramClient(StringSession(TG_SESSION), api_id, TG_API_HASH, receive_updates=False)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            return None, "TELETHON_SESSION غير صالحة/منتهية — ولّدها من جديد بـ gen_session.py"
+    except Exception as e:
+        log.exception("Telethon connect failed")
         try:
-            supply = float(mcap) / price
-        except (TypeError, ValueError, ZeroDivisionError):
-            supply = None
+            await client.disconnect()
+        except Exception:
+            pass
+        return None, f"فشل اتصال Telethon: {type(e).__name__}: {e}"
+    me = None
+    try:
+        me = await client.get_me()
+    except Exception:
+        pass
+    if me is not None and getattr(me, "bot", False):
+        await client.disconnect()
+        return None, "TELETHON_SESSION تخص بوتاً — استخدم جلسة حساب مستخدم عادي"
+    log.info("Telethon connected (user session)")
+    return client, None
 
-    def to_mcap(p):
-        return p * supply if supply else None
 
-    return {
-        "entry_low": entry_low, "entry_high": entry_high,
-        "stop_loss": stop_loss,
-        "tp1": tp1, "tp2": tp2,
-        "swing_low": swing_low, "swing_high": swing_high, "timeframe": timeframe,
-        "zone_status": zone_status,
-        "rr": rr, "estimated": estimated, "liq_note": liq_note,
-        "mcap_entry_low": to_mcap(entry_low), "mcap_entry_high": to_mcap(entry_high),
-        "mcap_stop_loss": to_mcap(stop_loss),
-        "mcap_tp1": to_mcap(tp1), "mcap_tp2": to_mcap(tp2),
+async def _read_channel(tl, limit: int, cutoff: float, info: dict) -> list:
+    """أحدث الرسائل أولاً → [{id, ts, text}] مع نص الرسالة وروابطها (hidden links/أزرار/معاينة)."""
+    out: list = []
+    async for msg in tl.iter_messages(SIGNAL_CHANNEL, limit=limit):
+        ts = msg.date.timestamp() if getattr(msg, "date", None) else None
+        info["messages"] += 1
+        if ts:
+            info["newest_ts"] = max(info.get("newest_ts", 0.0), ts)
+        if ts and ts < cutoff:
+            info["expired"] += 1
+            break  # الرسائل مرتبة من الأحدث → ما بعدها أقدم
+        parts = [msg.raw_text or ""]
+        try:
+            for ent, _txt in msg.get_entities_text():
+                if getattr(ent, "url", None):
+                    parts.append(ent.url)           # رابط مخفي خلف نص
+        except Exception:
+            pass
+        wp = getattr(getattr(msg, "media", None), "webpage", None)
+        if getattr(wp, "url", None):
+            parts.append(wp.url)                    # معاينة الرابط
+        try:
+            for row in msg.buttons or []:
+                for b in row:
+                    if getattr(b, "url", None):
+                        parts.append(b.url)         # أزرار inline
+        except Exception:
+            pass
+        out.append({"id": msg.id, "ts": ts, "text": "\n".join(parts)})
+    return out
+
+
+def _describe_tl_error(e: Exception) -> str:
+    name = type(e).__name__
+    if name == "BotMethodInvalidError":
+        return "Telethon: الجلسة جلسة بوت والبوتات لا تقرأ سجل القنوات — استخدم TELETHON_SESSION لحساب مستخدم"
+    if name == "FloodWaitError" and getattr(e, "seconds", None):
+        return f"Telethon: FloodWait — انتظر {e.seconds} ثانية"
+    return f"Telethon: {name}: {e}"
+
+
+async def _read_http(client: httpx.AsyncClient, info: dict, cutoff: float, errors: list):
+    """يجرّب مرايا المعاينة العامة بالترتيب. يرجع (رسائل، نجحت_القراءة)."""
+    for tmpl in SIGNAL_HTTP_MIRRORS:
+        base = tmpl.format(ch=SIGNAL_CHANNEL)
+        host = base.split("/")[2] if "//" in base else base
+        info.update(messages=0, expired=0, newest_ts=0.0)
+        msgs: list = []
+        seen: set = set()
+        before = None
+        reached = False
+        for _ in range(SIGNAL_PAGES):
+            try:
+                r = await client.get(base, params={"before": before} if before else None, headers=WEB_HEADERS)
+            except httpx.HTTPError as e:
+                errors.append(f"{host}: {type(e).__name__}")
+                break
+            if r.status_code != 200:
+                errors.append(f"{host}: HTTP {r.status_code}")
+                break
+            if "tgme_widget_message" not in r.text:
+                errors.append(f"{host}: لا معاينة عامة أو الطلب محجوب")
+                break
+            reached = True
+            page = [m for m in parse_channel_html(r.text) if m["id"] not in seen]
+            if not page:
+                break
+            oldest = None
+            for m in page:
+                seen.add(m["id"])
+                info["messages"] += 1
+                if m["ts"]:
+                    info["newest_ts"] = max(info["newest_ts"], m["ts"])
+                    oldest = m["ts"] if oldest is None else min(oldest, m["ts"])
+                if m["ts"] and m["ts"] < cutoff:
+                    info["expired"] += 1
+                    continue
+                msgs.append(m)
+            if oldest is not None and oldest < cutoff:
+                break
+            before = min(m["id"] for m in page)
+            await asyncio.sleep(0.3)
+        if reached:
+            info["source"] = f"HTTP ({host})"
+            return msgs, True
+    return [], False
+
+
+async def discover_signals(client: Optional[httpx.AsyncClient] = None):
+    """يقرأ آخر رسائل القناة: Telethon (جلسة مستخدم) ثم HTTP كاحتياط. يرجع (Signal الأحدث أولاً، info)."""
+    info = {
+        "ok": False, "error": None, "errors": [], "source": None, "messages": 0, "expired": 0,
+        "with_addr": 0, "addresses": 0, "newest_age_min": None, "newest_ts": 0.0,
+    }
+    now = time.time()
+    cutoff = now - SIGNAL_MAX_AGE_HOURS * 3600
+    errors: list = info["errors"]
+    msgs: list = []
+    got = False
+
+    tl = TL.get("client")
+    if tl is not None:
+        try:
+            msgs = await asyncio.wait_for(_read_channel(tl, SIGNAL_MESSAGE_LIMIT, cutoff, info), timeout=25)
+            got = True
+            info["source"] = "Telethon"
+        except asyncio.TimeoutError:
+            errors.append("Telethon: انتهت مهلة القراءة")
+        except Exception as e:
+            log.warning("Telethon read failed: %s: %s", type(e).__name__, e)
+            errors.append(_describe_tl_error(e))
+    else:
+        errors.append("Telethon: " + (TL.get("error") or "غير مهيّأ"))
+
+    if not got and client is not None:
+        msgs, got = await _read_http(client, info, cutoff, errors)
+
+    info["ok"] = got
+    if not got:
+        info["error"] = " | ".join(errors)
+        return [], info
+
+    found: dict = {}
+
+    def add(addr: str, post_id: int, ts, is_hint: bool) -> None:
+        cur = found.get(addr)
+        if cur is None or post_id > cur.post_id:
+            found[addr] = Signal(addr, post_id, ts, is_hint and not (cur and not cur.is_hint))
+
+    for m in msgs:
+        mints, hints = extract_addresses(m["text"])
+        if mints or hints:
+            info["with_addr"] += 1
+        for a in mints:
+            add(a, m["id"], m["ts"], False)
+        for a in hints:
+            add(a, m["id"], m["ts"], True)
+
+    if info["newest_ts"]:
+        info["newest_age_min"] = (now - info["newest_ts"]) / 60
+    ordered = sorted(found.values(), key=lambda s: (s.ts or 0, s.post_id), reverse=True)
+    info["addresses"] = len(ordered)
+    return ordered[:MAX_DISCOVERED_TOKENS], info
+
+
+def _merge_pairs(best: dict, payloads: list) -> None:
+    for data in payloads:
+        if isinstance(data, dict):
+            data = data.get("pairs")
+        if not isinstance(data, list):
+            continue
+        for p in data:
+            if not isinstance(p, dict) or p.get("chainId") != "solana":
+                continue
+            base = (p.get("baseToken") or {}).get("address")
+            if not base or base in EXCLUDED_MINTS:
+                continue
+            liq = to_float((p.get("liquidity") or {}).get("usd"))
+            cur = best.get(base)
+            if cur is None or liq > to_float((cur.get("liquidity") or {}).get("usd")):
+                best[base] = p
+
+
+async def fetch_gecko_pairs(client: httpx.AsyncClient, mints: list) -> list:
+    """احتياط: GeckoTerminal (tokens/multi + top_pools) محوَّل لشكل أزواج DexScreener."""
+    out: list = []
+    for i in range(0, len(mints), 30):
+        chunk = mints[i:i + 30]
+        data = await fetch_json(
+            client, f"{GECKO}/networks/solana/tokens/multi/{','.join(chunk)}", params={"include": "top_pools"}
+        )
+        if not isinstance(data, dict):
+            continue
+        pools = {p.get("id"): p for p in (data.get("included") or []) if isinstance(p, dict)}
+        for tok in data.get("data") or []:
+            try:
+                ta = tok.get("attributes") or {}
+                mint = ta.get("address")
+                tp = ((tok.get("relationships") or {}).get("top_pools") or {}).get("data") or []
+                pool = pools.get(tp[0].get("id")) if tp else None
+                if not mint or not pool:
+                    continue
+                pa = pool.get("attributes") or {}
+                dex_id = str((((pool.get("relationships") or {}).get("dex") or {}).get("data") or {}).get("id") or "")
+                created_ms = None
+                if pa.get("pool_created_at"):
+                    try:
+                        created_ms = datetime.fromisoformat(str(pa["pool_created_at"]).replace("Z", "+00:00")).timestamp() * 1000
+                    except ValueError:
+                        created_ms = None
+                tx = pa.get("transactions") or {}
+                out.append({
+                    "chainId": "solana",
+                    "dexId": dex_id.replace("-", ""),          # pump-fun → pumpfun
+                    "pairAddress": pa.get("address"),
+                    "baseToken": {"address": mint, "name": ta.get("name"), "symbol": ta.get("symbol")},
+                    "priceUsd": ta.get("price_usd"),
+                    "liquidity": {"usd": pa.get("reserve_in_usd")},
+                    "marketCap": pa.get("market_cap_usd") or ta.get("market_cap_usd"),
+                    "fdv": pa.get("fdv_usd") or ta.get("fdv_usd"),
+                    "volume": pa.get("volume_usd") or {},
+                    "priceChange": pa.get("price_change_percentage") or {},
+                    "txns": {k: {"buys": (v or {}).get("buys"), "sells": (v or {}).get("sells")} for k, v in tx.items()},
+                    "pairCreatedAt": created_ms,
+                })
+            except Exception:
+                log.exception("gecko pair parse failed")
+    return out
+
+
+async def fetch_pairs(client: httpx.AsyncClient, addresses: list, pair_hints: Any = (), sink: Optional[dict] = None) -> list:
+    """sink: قاموس يُملأ تدريجياً فتبقى النتائج الجزئية حتى لو انتهت المهلة."""
+    best: dict = sink if sink is not None else {}
+    hint_set = set(pair_hints)
+    mints = [a for a in addresses if a not in hint_set]
+
+    # 1) DexScreener (الجديد)
+    chunks = [addresses[i:i + 30] for i in range(0, len(addresses), 30)]
+    responses = await asyncio.gather(
+        *(fetch_json(client, f"{DEX}/tokens/v1/solana/{','.join(c)}") for c in chunks)
+    )
+    _merge_pairs(best, list(responses))
+
+    # 2) DexScreener (endpoint القديم) لما لم يُحَل
+    missing = [a for a in mints if a not in best]
+    if missing:
+        mchunks = [missing[i:i + 30] for i in range(0, len(missing), 30)]
+        resp2 = await asyncio.gather(
+            *(fetch_json(client, f"{DEX}/latest/dex/tokens/{','.join(c)}") for c in mchunks)
+        )
+        _merge_pairs(best, list(resp2))
+
+    # 3) GeckoTerminal احتياطاً لما لم يُحَل
+    missing = [a for a in mints if a not in best]
+    if missing:
+        _merge_pairs(best, [await fetch_gecko_pairs(client, missing)])
+
+    # عناوين جاءت من روابط DexScreener ولم تُحَل كعملات → نجرّبها كعناوين أزواج
+    known_pairs = {p.get("pairAddress") for p in best.values()}
+    hints = [h for h in dict.fromkeys(hint_set) if h not in best and h not in known_pairs]
+    if hints:
+        hchunks = [hints[i:i + 30] for i in range(0, len(hints), 30)]
+        hresp = await asyncio.gather(
+            *(fetch_json(client, f"{DEX}/latest/dex/pairs/solana/{','.join(c)}") for c in hchunks)
+        )
+        _merge_pairs(best, list(hresp))
+    return list(best.values())
+
+
+async def probe_apis(client: httpx.AsyncClient) -> list:
+    """اختبار مباشر لاتصال السيرفر بكل مصدر (يظهر في /diag)."""
+    sol = "So11111111111111111111111111111111111111112"
+    usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    tests = {
+        "DexScreener": f"{DEX}/tokens/v1/solana/{sol}",
+        "GeckoTerminal": f"{GECKO}/networks/solana/tokens/{sol}",
+        "RugCheck": f"{RUGCHECK}/tokens/{usdc}/report",
     }
 
+    async def one(name: str, url: str):
+        t0 = time.time()
+        try:
+            r = await client.get(url, timeout=10)
+            return name, f"{'✅' if r.status_code == 200 else '❌'} HTTP {r.status_code} ({time.time() - t0:.1f}s)"
+        except Exception as e:
+            return name, f"❌ {type(e).__name__}"
 
-# ------------------------------------------------------------------------- #
-#  بناء التقرير النهائي (عربي)
-# ------------------------------------------------------------------------- #
-
-def green_red(cond: Optional[bool], yes_label: str, no_label: str) -> str:
-    if cond is None:
-        return f"❓ {NA}"
-    return f"🟢 {yes_label}" if cond else f"🔴 {no_label}"
+    return list(await asyncio.gather(*(one(n, u) for n, u in tests.items())))
 
 
-def build_scalp_section(rating: dict, scalp: Optional[dict]) -> str:
-    if rating.get("hard_block"):
-        # مانع صريح مطلق: نصب كامل (Mint/Freeze)، تجميع متطرف (>50%)، قنص
-        # لسا متحكم، أو انهيار مؤكد الآن. لا استثناء هنا مهما كان الزخم.
-        bullet_reasons = "\n".join(f"  ▫️ {r}" for r in rating["block_reasons"]) or "  ▫️ خطر حرج في الفحوصات"
-        return (
-            "⚡ *خطة السكالبينغ والتداول (Scalp Setup):*\n"
-            f"🔴 *لا توجد خطة دخول* — رغم تقييم {rating['total']}/100، هذي العملة فيها خطر "
-            "حرج (تفريغ محفظة واحدة، نصب كامل، أو انهيار مؤكد الآن):\n"
-            f"{bullet_reasons}"
-        )
-    if rating.get("caution_block"):
-        # تركيز مرتفع (25-50%) بلا زخم قوي يثبت إنه مو خطر وشيك. ما منعناهاش
-        # منعاً مطلقاً (زي hard_block) لأنها ممكن تكون فرصة حقيقية، لكن بلا
-        # دليل زخم واضح ما نعطيش خطة دخول بأرقام دقيقة.
-        bullet_reasons = "\n".join(f"  ▫️ {r}" for r in rating["caution_reasons"]) or "  ▫️ تركيز مرتفع بلا زخم مؤكد"
-        return (
-            "⚡ *خطة السكالبينغ والتداول (Scalp Setup):*\n"
-            f"🟡 *لا توجد خطة دخول دقيقة* — تقييم {rating['total']}/100، تركيز الحاملين مرتفع "
-            "وما فيش دليل زخم قوي يعوّضه حالياً (راقبها: إذا الحجم والشراء زادوا بقوة، فرصة ممكنة):\n"
-            f"{bullet_reasons}"
-        )
-    # ثغرة انصلحت: reduced_size لازم يتجاوز هذا الحد، مو يتوقف عليه - عقوبة
-    # التركيز تنزّل التقييم الخام صناعياً حتى لو الزخم أثبت نفسه فعلاً.
-    if rating["total"] < SCALP_MIN_SCORE and not rating.get("reduced_size"):
-        reasons = rating["all_reasons"][:3] or ["التقييم العام تحت الحد الأدنى للسكالبينغ الآمن"]
-        bullet_reasons = "\n".join(f"  ▫️ {r}" for r in reasons)
-        return (
-            "⚡ *خطة السكالبينغ والتداول (Scalp Setup):*\n"
-            f"🔴 *لا توجد خطة دخول* — التقييم ({rating['total']}/100) تحت الحد الآمن ({SCALP_MIN_SCORE}+).\n"
-            f"*أسباب التحذير:*\n{bullet_reasons}"
-        )
-    if not scalp:
-        return (
-            "⚡ *خطة السكالبينغ والتداول (Scalp Setup):*\n"
-            "⚠️ التقييم إيجابي لكن ما كفاش بيانات سعرية موثوقة لحساب منطقة دخول دقيقة."
-        )
+# ───────────────────────────── المقاييس والفلترة الأولية ─────────────────────────────
 
-    tf_label = {"5m": "شموع 5 دقائق", "1m": "شموع دقيقة واحدة"}.get(scalp["timeframe"], scalp["timeframe"])
-    est_tag = (
-        " _(تقدير تقريبي، ما قدرناش نجيب شموع موثوقة)_"
-        if scalp["estimated"]
-        else f" _(مبني على Golden Zone لآخر موجة — {tf_label})_"
+
+def extract_metrics(pair: dict) -> Optional[dict]:
+    base = pair.get("baseToken") or {}
+    mint = base.get("address")
+    pair_addr = pair.get("pairAddress")
+    if not mint or not pair_addr:
+        return None
+    vol = pair.get("volume") or {}
+    chg = pair.get("priceChange") or {}
+    tx = pair.get("txns") or {}
+    t5 = tx.get("m5") or {}
+
+    created = to_float(pair.get("pairCreatedAt"))
+    age_min = (time.time() * 1000 - created) / 60000 if created > 0 else None
+
+    m = {
+        "mint": mint,
+        "name": str(base.get("name") or "Unknown"),
+        "symbol": str(base.get("symbol") or "?"),
+        "pair": pair_addr,
+        "dex": str(pair.get("dexId") or ""),
+        "price": to_float(pair.get("priceUsd")),
+        "liq": to_float((pair.get("liquidity") or {}).get("usd")),
+        "mcap": to_float(pair.get("marketCap")) or to_float(pair.get("fdv")),
+        "vol5": to_float(vol.get("m5")),
+        "vol1": to_float(vol.get("h1")),
+        "vol6": to_float(vol.get("h6")),
+        "vol24": to_float(vol.get("h24")),
+        "chg5": to_float(chg.get("m5")),
+        "chg1": to_float(chg.get("h1")),
+        "chg6": to_float(chg.get("h6")),
+        "chg24": to_float(chg.get("h24")),
+        "buys5": to_float(t5.get("buys")),
+        "sells5": to_float(t5.get("sells")),
+        "age_min": age_min,
+    }
+    m["vol_pace"] = (m["vol5"] * 12 / m["vol1"]) if m["vol1"] > 0 else 0.0
+    m["h1_vs_h6"] = (m["vol1"] / (m["vol6"] / 6)) if m["vol6"] > 0 else 0.0
+    m["liq_mcap"] = (m["liq"] / m["mcap"]) if m["mcap"] > 0 else 0.0
+    total5 = m["buys5"] + m["sells5"]
+    m["buy_ratio5"] = (m["buys5"] / total5) if total5 > 0 else 0.0
+    return m
+
+
+def pre_filter(m: dict) -> Optional[str]:
+    if m["dex"] == "pumpfun":
+        return "لم تهاجر من Bonding Curve بعد"
+    if m["price"] <= 0:
+        return "بيانات سعر غير صالحة"
+    if m["liq"] < MIN_LIQUIDITY_USD:
+        return "سيولة منخفضة"
+    if not (MIN_MCAP_USD <= m["mcap"] <= MAX_MCAP_USD):
+        return "الماركت كاب خارج النطاق"
+    if m["age_min"] is None or m["age_min"] < MIN_PAIR_AGE_MIN:
+        return "عمر الزوج قصير جداً"
+    if m["vol1"] < MIN_VOLUME_H1_USD:
+        return "حجم تداول 1h ضعيف"
+    if m["chg5"] <= -MAX_5M_DROP_PCT or m["chg1"] <= -MAX_1H_DROP_PCT:
+        return "انهيار حاد في السعر"
+    if m["chg1"] > MAX_H1_CHANGE_PCT:
+        return "ارتفاع مفرط خلال ساعة (خطر قمة)"
+    return None
+
+
+def reason_detail(m: dict, reason: str) -> str:
+    """يحوّل سبب الفلتر الأولي إلى جملة بالأرقام الفعلية والحد المطلوب."""
+    try:
+        if reason == "سيولة منخفضة":
+            return f"سيولة {fmt_usd(m['liq'])} (الحد الأدنى {fmt_usd(MIN_LIQUIDITY_USD)})"
+        if reason == "الماركت كاب خارج النطاق":
+            return f"ماركت كاب {fmt_usd(m['mcap'])} (النطاق {fmt_usd(MIN_MCAP_USD)}–{fmt_usd(MAX_MCAP_USD)})"
+        if reason == "عمر الزوج قصير جداً":
+            if m["age_min"] is None:
+                return "عمر الزوج غير معروف"
+            return f"عمر الزوج {m['age_min']:.0f} دقيقة (الحد الأدنى {MIN_PAIR_AGE_MIN:.0f})"
+        if reason == "حجم تداول 1h ضعيف":
+            return f"فوليوم 1h {fmt_usd(m['vol1'])} (الحد الأدنى {fmt_usd(MIN_VOLUME_H1_USD)})"
+        if reason == "انهيار حاد في السعر":
+            return f"هبوط 5د {m['chg5']:+.0f}% / 1h {m['chg1']:+.0f}%"
+        if reason.startswith("ارتفاع مفرط"):
+            return f"صعود 1h {m['chg1']:+.0f}% (الحد {MAX_H1_CHANGE_PCT:.0f}%)"
+        if reason.startswith("لم تهاجر"):
+            return "ما زالت على Bonding Curve (لا LP للفحص) — سأراقبها وأفحصها فور الهجرة"
+    except Exception:
+        pass
+    return reason
+
+
+def sec_detail(sec: "Security") -> str:
+    nums = [f"Top10 {sec.top10:.0f}%"]
+    if sec.dev is not None:
+        nums.append(f"Dev {sec.dev:.1f}%")
+    if sec.lp_locked is not None:
+        nums.append(f"LP {sec.lp_locked:.0f}%")
+    if sec.rug_norm is not None:
+        nums.append(f"RugCheck {sec.rug_norm:.0f}/100")
+    return " + ".join(sec.reasons) + " [" + " • ".join(nums) + "]"
+
+
+def prelim_rank(m: dict) -> float:
+    return (
+        min(m["vol_pace"], 4)
+        + min(m["h1_vs_h6"], 6) / 2
+        + min(m["liq_mcap"], 0.2) * 10
+        + (1.0 if m["chg1"] > 0 else 0.0)
     )
-    rr_line = f"1:{scalp['rr']:.1f}" if scalp["rr"] else NA
 
-    def level(label, p, mp, extra_pct=None):
-        s = f"{label} {fmt_price(p)}"
-        if extra_pct is not None:
-            s += f" ({'+' if extra_pct >= 0 else ''}{extra_pct:.0f}%)"
-        if mp is not None:
-            s += f"\n   💠 {fmt_usd(mp)}"
-        return s
 
-    entry_mid = (scalp["entry_low"] + scalp["entry_high"]) / 2
-    tp1_pct = (scalp["tp1"] / entry_mid - 1) * 100 if entry_mid else None
-    tp2_pct = (scalp["tp2"] / entry_mid - 1) * 100 if entry_mid else None
-    sl_pct = (scalp["stop_loss"] / entry_mid - 1) * 100 if entry_mid else None
+# ───────────────────────────── الفلترة الأمنية (RugCheck) ─────────────────────────────
 
-    lines = [
-        "⚡ *خطة السكالبينغ والتداول (Scalp Setup):*",
-    ]
-    if rating.get("reduced_size"):
-        lines.append(
-            "🟡 *تحذير:* تركيز الحاملين مرتفع، لكن الزخم الشرائي قوي ومستمر وهذا يعوّضه جزئياً. "
-            "ادخل بنص الحجم المعتاد فقط، وخروج أسرع من المعتاد."
+
+@dataclass
+class Security:
+    passed: bool
+    reasons: list = field(default_factory=list)      # حظر صلب
+    warnings: list = field(default_factory=list)     # مخاطرة أعلى (المستوى B)
+    top10: float = 0.0
+    dev: Optional[float] = None
+    lp_locked: Optional[float] = None
+    rug_norm: Optional[float] = None
+    rug_raw: Optional[float] = None
+    bundled: bool = False
+
+
+_RUG_CACHE: dict = {}
+
+
+async def get_rugcheck_report(client: httpx.AsyncClient, mint: str) -> Optional[dict]:
+    cached = _RUG_CACHE.get(mint)
+    if cached and time.time() - cached[0] < RUGCHECK_CACHE_SEC:
+        return cached[1]
+    data = await fetch_json(client, f"{RUGCHECK}/tokens/{mint}/report", retries=2)
+    await asyncio.sleep(0.2)
+    if isinstance(data, dict):
+        _RUG_CACHE[mint] = (time.time(), data)
+        return data
+    return None
+
+
+def analyze_security(report: dict, pair_address: str) -> Security:
+    reasons: list = []
+    soft: list = []
+    token = report.get("token") if isinstance(report.get("token"), dict) else {}
+
+    def authority_revoked(key: str) -> Optional[bool]:
+        for src in (token, report):
+            if key in src:
+                return src[key] in (None, "", "null")
+        return None
+
+    mint_rev = authority_revoked("mintAuthority")
+    if mint_rev is not True:
+        reasons.append("Mint Authority غير ملغاة" if mint_rev is False else "تعذر التحقق من Mint Authority")
+    freeze_rev = authority_revoked("freezeAuthority")
+    if freeze_rev is not True:
+        reasons.append("Freeze Authority غير ملغاة" if freeze_rev is False else "تعذر التحقق من Freeze Authority")
+
+    if report.get("rugged") is True:
+        reasons.append("التوكن مُعلَّم كـ Rugged")
+    tf = report.get("transferFee")
+    if isinstance(tf, dict) and to_float(tf.get("pct")) > 0:
+        reasons.append("رسوم تحويل على التوكن")
+
+    risks = [r for r in (report.get("risks") or []) if isinstance(r, dict)]
+    if any(str(r.get("level", "")).lower() == "danger" for r in risks):
+        reasons.append("RugCheck: مخاطر بمستوى Danger")
+
+    norm = report.get("score_normalised")
+    raw = report.get("score")
+    rug_norm = to_float(norm, -1.0) if norm is not None else None
+    rug_raw = to_float(raw, -1.0) if raw is not None else None
+    if rug_norm is not None:
+        if rug_norm > RISKY_MAX_RUG_NORM:
+            reasons.append("تقييم RugCheck سيئ")
+        elif rug_norm > RUGCHECK_MAX_NORM:
+            soft.append(f"RugCheck ليس Good (خطورة {rug_norm:.0f}/100)")
+    elif rug_raw is not None:
+        if rug_raw > RUGCHECK_MAX_RAW:
+            reasons.append("تقييم RugCheck سيئ")
+    else:
+        reasons.append("تعذر قراءة تقييم RugCheck")
+
+    markets = [mk for mk in (report.get("markets") or []) if isinstance(mk, dict)]
+    chosen = next((mk for mk in markets if mk.get("pubkey") == pair_address), None)
+    if chosen is None and markets:
+        chosen = max(
+            markets,
+            key=lambda mk: to_float((mk.get("lp") or {}).get("baseUSD"))
+            + to_float((mk.get("lp") or {}).get("quoteUSD")),
         )
-    lines += [
-        f"📐 *الموجة الأخيرة:* قاع {fmt_price(scalp['swing_low'])} ← قمة {fmt_price(scalp['swing_high'])}",
-        f"{scalp['zone_status']}",
-        f"🎯 *منطقة الدخول (Golden Zone 0.5-0.618):* {fmt_price(scalp['entry_low'])} — {fmt_price(scalp['entry_high'])}{est_tag}"
-        + (f"\n   💠 {fmt_usd(scalp['mcap_entry_low'])} — {fmt_usd(scalp['mcap_entry_high'])}" if scalp['mcap_entry_low'] is not None else ""),
-        f"🚀 {level('*الهدف الأول (TP1 — امتداد 1.272):*', scalp['tp1'], scalp['mcap_tp1'], tp1_pct)}",
-        f"🚀 {level('*الهدف الثاني (TP2 — امتداد 1.618):*', scalp['tp2'], scalp['mcap_tp2'], tp2_pct)}",
-        f"🛑 {level('*وقف الخسارة (تحت قاع الموجة بـ1.5%):*', scalp['stop_loss'], scalp['mcap_stop_loss'], sl_pct)}",
-        f"⚖️ *نسبة المخاطرة/العائد:* {rr_line}",
+    lp_locked: Optional[float] = None
+    if chosen is not None and isinstance(chosen.get("lp"), dict) and "lpLockedPct" in chosen["lp"]:
+        lp_locked = to_float(chosen["lp"].get("lpLockedPct"))
+    if lp_locked is None:
+        reasons.append("تعذر التحقق من حالة LP")
+    elif lp_locked < MIN_LP_LOCKED_PCT:
+        reasons.append("LP غير محروقة/مقفولة بالكامل")
+
+    pool_accounts = set()
+    for mk in markets:
+        for key in ("pubkey", "liquidityA", "liquidityB", "mintLP"):
+            if mk.get(key):
+                pool_accounts.add(mk[key])
+    all_holders = [h for h in (report.get("topHolders") or []) if isinstance(h, dict)]
+    real_holders = [
+        h for h in all_holders
+        if h.get("address") not in pool_accounts and h.get("owner") not in pool_accounts
     ]
-    if scalp["liq_note"]:
-        lines.append(scalp["liq_note"])
+    real_holders.sort(key=lambda h: to_float(h.get("pct")), reverse=True)
+    top10 = sum(to_float(h.get("pct")) for h in real_holders[:10])
+    if not all_holders:
+        reasons.append("تعذر جلب بيانات الحيتان")
+    elif top10 > RISKY_MAX_TOP10_PCT:
+        reasons.append("تركّز كبار الملاك Top10 مرتفع جداً")
+    elif top10 > MAX_TOP10_PCT:
+        soft.append(f"Top10 مرتفع ({top10:.0f}%)")
+
+    dev: Optional[float] = None
+    creator = report.get("creator")
+    if creator:
+        dev = 0.0
+        for h in all_holders:
+            if h.get("address") == creator or h.get("owner") == creator:
+                dev = max(dev, to_float(h.get("pct")))
+        supply = to_float(token.get("supply"))
+        creator_bal = to_float(report.get("creatorBalance"))
+        if supply > 0 and creator_bal > 0:
+            dev = max(dev, creator_bal / supply * 100)
+        if dev > RISKY_MAX_DEV_PCT:
+            reasons.append("حصة المطور Dev مرتفعة جداً")
+        elif dev > MAX_DEV_PCT:
+            soft.append(f"حصة المطور {dev:.1f}%")
+
+    bundled = (
+        any(h.get("insider") for h in real_holders)
+        or to_float(report.get("graphInsidersDetected")) > 0
+        or bool(report.get("insiderNetworks"))
+        or any(
+            kw in str(r.get("name", "")).lower()
+            for r in risks
+            for kw in ("bundl", "snip", "insider")
+        )
+    )
+    if bundled:
+        soft.append("أنماط Bundled/Sniped/Insider")
+
+    if soft and not ALLOW_RISKY:
+        reasons.extend(soft)
+        soft = []
+
+    return Security(
+        passed=not reasons,
+        reasons=reasons,
+        warnings=soft,
+        top10=top10,
+        dev=dev,
+        lp_locked=lp_locked,
+        rug_norm=rug_norm,
+        rug_raw=rug_raw,
+        bundled=bundled,
+    )
+
+
+# ───────────────────────────── الخطط (Scalp / Momentum / Hold) ─────────────────────────────
+
+
+@dataclass
+class ScalpPlan:
+    swing_low: float
+    swing_high: float
+    zone_low: float
+    zone_high: float
+    status: str            # IN_ZONE | ABOVE_ZONE | WAIT | MOMENTUM | HOLD
+    above_pct: float
+    entry: float
+    tp1: float
+    tp2: float
+    ext1272: float
+    ext1618: float
+    sl: float
+    risk_pct: float
+    rr1: float
+    rr2: float
+    leg_pct: float
+    kind: str = "SCALP"
+
+
+def candle_tf(age_min: Optional[float]) -> int:
+    """العملة الحديثة (<3 ساعات) لا تملك 20 شمعة 5د، فنستعمل شموع الدقيقة (كما يتداولها المستخدم عادة)."""
+    return 1 if (age_min is not None and age_min < 180) else 5
+
+
+def fib_params(tf: int):
+    """(أقل عدد شموع، نافذة التحليل، نظرة الـ Swing) حسب الإطار الزمني."""
+    return (25, 120, 60) if tf == 1 else (MIN_CANDLES, MAX_WINDOW_CANDLES, SWING_LOOKBACK_CANDLES)
+
+
+async def fetch_candles(client: httpx.AsyncClient, pool: str, tf: int = 5, limit: Optional[int] = None) -> list:
+    data = await fetch_json(
+        client,
+        f"{GECKO}/networks/solana/pools/{pool}/ohlcv/minute",
+        params={"aggregate": tf, "limit": limit or (200 if tf == 1 else 100), "currency": "usd"},
+    )
+    rows = (((data or {}).get("data") or {}).get("attributes") or {}).get("ohlcv_list") if isinstance(data, dict) else None
+    candles = []
+    for row in rows or []:
+        if isinstance(row, (list, tuple)) and len(row) >= 6:
+            ts, o, h, l, c, v = (to_float(x) for x in row[:6])
+            if h > 0 and l > 0 and h >= l:
+                candles.append((ts, o, h, l, c, v))
+    candles.sort(key=lambda x: x[0])
+    return candles
+
+
+def compute_scalp_plan(candles: list, price: float, tf: int = 5):
+    """SCALP: يرجع (ScalpPlan, None) أو (None, سبب_الرفض). WAIT = السعر بعيد فوق المنطقة."""
+    min_c, max_w, lookback = fib_params(tf)
+    if len(candles) < min_c:
+        return None, "شموع غير كافية لحساب Fibonacci"
+
+    window = candles[-max_w:]
+    hi_idx = max(range(len(window)), key=lambda i: window[i][2])
+    high = window[hi_idx][2]
+    seg = window[max(0, hi_idx - lookback): hi_idx + 1]
+    lo_rel = min(range(len(seg)), key=lambda i: seg[i][3])
+    low = seg[lo_rel][3]
+    if lo_rel == len(seg) - 1:
+        return None, "لا توجد موجة صاعدة واضحة (Swing Low/High)"
+    if price > high:
+        high = price
+
+    rng = high - low
+    if low <= 0 or rng / low * 100 < MIN_LEG_PCT:
+        return None, "الموجة الصاعدة ضعيفة"
+
+    zone_high = high - 0.5 * rng
+    zone_low = high - 0.618 * rng
+    sl = low * (1 - SL_BUFFER)
+
+    if zone_low * 0.99 <= price <= zone_high * 1.01:
+        status, entry, above_pct = "IN_ZONE", price, 0.0
+    elif price > zone_high * 1.01:
+        above_pct = (price / zone_high - 1) * 100
+        status = "ABOVE_ZONE" if above_pct <= MAX_ABOVE_ZONE_PCT else "WAIT"
+        entry = (zone_low + zone_high) / 2
+    else:
+        return None, "السعر كسر المنطقة الذهبية للأسفل"
+
+    if entry <= sl:
+        return None, "وقف الخسارة فوق نقطة الدخول"
+    risk_pct = (entry - sl) / entry * 100
+    if risk_pct > MAX_SL_RISK_PCT:
+        return None, "وقف الخسارة بعيد جداً (مخاطرة عالية)"
+
+    return ScalpPlan(
+        swing_low=low,
+        swing_high=high,
+        zone_low=zone_low,
+        zone_high=zone_high,
+        status=status,
+        above_pct=above_pct,
+        entry=entry,
+        tp1=entry * (1 + TP1_PCT),
+        tp2=entry * (1 + TP2_PCT),
+        ext1272=low + 1.272 * rng,
+        ext1618=low + 1.618 * rng,
+        sl=sl,
+        risk_pct=risk_pct,
+        rr1=(TP1_PCT * 100) / risk_pct,
+        rr2=(TP2_PCT * 100) / risk_pct,
+        leg_pct=rng / low * 100,
+        kind="SCALP",
+    ), None
+
+
+def momentum_ok(m: dict) -> bool:
+    if not (3 <= m["chg1"] <= MOMENTUM_MAX_H1_PCT) or m["chg5"] < -1 or m["buy_ratio5"] < 0.45:
+        return False
+    if m["vol_pace"] >= 0.8:                 # فوليوم متسارع
+        return True
+    # اندفاع سعري حديث بسيطرة واضحة للمشترين حتى لو تباطأ فوليوم آخر 5 دقائق عن متوسط الساعة
+    return m["chg5"] >= 5 and m["buy_ratio5"] >= 0.55 and m["vol5"] > 0
+
+
+def hold_ok(m: dict) -> bool:
+    age = m["age_min"] or 0
+    return (
+        age >= 1440
+        and m["liq"] >= 40_000
+        and m["chg24"] > 0
+        and m["chg1"] >= -5
+        and m["mcap"] > 0
+        and m["vol24"] / m["mcap"] >= 0.2
+    )
+
+
+def compute_alt_plan(kind: str, m: dict, candles: list) -> ScalpPlan:
+    price = m["price"]
+    if kind == "MOMENTUM":
+        zone_low, zone_high = price * 0.97, price
+        tp1, tp2 = price * 1.15, price * 1.30
+        sl = price * 0.88
+        if candles:
+            recent_low = min(c[3] for c in candles[-8:])
+            sl = clamp(recent_low * 0.985, price * 0.85, price * 0.93)
+    else:  # HOLD
+        zone_low, zone_high = price * 0.92, price
+        tp1, tp2 = price * 1.50, price * 2.00
+        sl = price * 0.75
+    risk_pct = (price - sl) / price * 100
+    return ScalpPlan(
+        swing_low=0.0,
+        swing_high=0.0,
+        zone_low=zone_low,
+        zone_high=zone_high,
+        status=kind,
+        above_pct=0.0,
+        entry=price,
+        tp1=tp1,
+        tp2=tp2,
+        ext1272=0.0,
+        ext1618=0.0,
+        sl=sl,
+        risk_pct=risk_pct,
+        rr1=((tp1 / price - 1) * 100) / risk_pct,
+        rr2=((tp2 / price - 1) * 100) / risk_pct,
+        leg_pct=0.0,
+        kind=kind,
+    )
+
+
+def market_flags(m: dict) -> list:
+    """عملة صغيرة/حديثة: تُقبل لكن بتحذير (فرصتها أكبر ومخاطرتها أعلى)."""
+    f = []
+    if m["liq"] < FLAG_LIQ_USD:
+        f.append(f"سيولة منخفضة {fmt_usd(m['liq'])} — خطر انزلاق")
+    if m["mcap"] < FLAG_MCAP_USD:
+        f.append(f"ماركت كاب صغير جداً {fmt_usd(m['mcap'])}")
+    if m["age_min"] is not None and m["age_min"] < FLAG_AGE_MIN:
+        f.append(f"زوج حديث جداً ({m['age_min']:.0f} دقيقة)")
+    if m["vol1"] > 0 and m["vol_pace"] < 0.8:
+        f.append(f"فوليوم 5د ×{m['vol_pace']:.1f} من متوسط الساعة — الزخم قد يكون منتهياً")
+    return f
+
+
+def compute_score(m: dict, sec: Security, plan: ScalpPlan):
+    """Score /100 = سيولة/MC (20) + فوليوم (20) + زخم (10) + جودة الدخول (25) + أمان (25) − عقوبة مخاطرة."""
+    b: dict = {}
+    b["liq_mcap"] = 20 * clamp(m["liq_mcap"] / 0.10, 0, 1)
+
+    pace = 8 * clamp(m["vol_pace"] / 2.0, 0, 1)
+    trend = 7 * clamp(m["h1_vs_h6"] / 3.0, 0, 1)
+    buys = 5 * clamp((m["buy_ratio5"] - 0.5) / 0.2, 0, 1)
+    b["volume"] = pace + trend + buys
+
+    mom = 0.0
+    if m["chg5"] > 0:
+        mom += 4 if m["chg5"] <= 25 else 2
+    if m["chg1"] > 0:
+        mom += 6 if m["chg1"] <= 150 else 3
+    b["momentum"] = mom
+
+    if plan.kind == "SCALP":
+        if plan.status == "IN_ZONE":
+            b["fib"] = 25.0
+        elif plan.status == "ABOVE_ZONE":
+            b["fib"] = 18 * (1 - 0.5 * clamp(plan.above_pct / MAX_ABOVE_ZONE_PCT, 0, 1))
+        else:
+            b["fib"] = 6.0
+    elif plan.kind == "MOMENTUM":
+        b["fib"] = 14.0
+    else:
+        b["fib"] = 12.0
+
+    safety = 10 * (1 - clamp(sec.top10 / MAX_TOP10_PCT, 0, 1))
+    safety += 5 * (1 - clamp((sec.dev or 0.0) / MAX_DEV_PCT, 0, 1)) if sec.dev is not None else 2.5
+    if sec.rug_norm is not None:
+        safety += 10 * (1 - clamp(sec.rug_norm / RUGCHECK_MAX_NORM, 0, 1))
+    else:
+        safety += 5
+    b["safety"] = safety
+    b["risk_penalty"] = -RISK_PENALTY if sec.warnings else 0.0
+    b["market_risk"] = -min(10, MARKET_FLAG_PENALTY * len(market_flags(m)))
+
+    total = int(round(sum(b.values())))
+    return int(clamp(total, 0, 100)), b
+
+
+# ───────────────────────────── المسح الكامل ─────────────────────────────
+
+
+@dataclass
+class Candidate:
+    m: dict
+    sec: Security
+    plan: ScalpPlan
+    score: int
+    breakdown: dict
+
+
+@dataclass
+class ScanResult:
+    ranked: list = field(default_factory=list)       # كل الصفقات مرتبة بالـ Score
+    stats: Counter = field(default_factory=Counter)
+    sources: dict = field(default_factory=dict)
+    signals: int = 0
+    discovered: int = 0
+    verdicts: dict = field(default_factory=dict)   # mint -> {sym, mcap, icon, text}
+    watch: list = field(default_factory=list)      # (m, sec|None, kind) → قائمة المراقبة
+    secs: dict = field(default_factory=dict)       # mint -> Security (لتسجيل الصفقات)
+    unresolved: list = field(default_factory=list)  # عقود بلا بيانات سوق
+    after_prefilter: int = 0
+    after_security: int = 0
+    finished_at: float = 0.0
+
+
+def grade_of(c: Candidate) -> str:
+    if not c.sec.warnings and not market_flags(c.m) and c.score >= MIN_SCORE:
+        return "🟢 قوية"
+    if c.score >= RISKY_MIN_SCORE:
+        return "🟡 متوسطة"
+    return "🟠 ضعيفة (مضاربة)"
+
+
+async def run_scan(
+    client: httpx.AsyncClient,
+    progress=None,
+    budget: float = SCAN_BUDGET_SEC,
+    extra: Optional[list] = None,
+) -> ScanResult:
+    t0 = time.time()
+
+    def left() -> float:
+        return max(2.0, budget - (time.time() - t0))
+
+    async def say(text: str) -> None:
+        if progress:
+            try:
+                await progress(text)
+            except Exception:
+                pass
+
+    res = ScanResult()
+
+    def set_v(m: dict, icon: str, text: str) -> None:
+        snap = {k: m.get(k) for k in ("price", "mcap", "liq", "age_min", "chg5", "chg1", "vol_pace",
+                                      "buy_ratio5", "vol1", "pair", "dex", "symbol")}
+        res.verdicts[m["mint"]] = {"sym": m["symbol"], "mcap": m["mcap"], "icon": icon, "text": text, "m": snap}
+
+    # 1) قراءة القناة
+    await say(f"📡 (1/4) قراءة آخر إشارات قناة @{SIGNAL_CHANNEL} ...")
+    signals, res.sources = await discover_signals(client)
+    if extra:  # عقود أرسلها المستخدم يدوياً (تُدمج مع عقود القناة، وعقد القناة له الأولوية)
+        have = {s.mint for s in signals}
+        signals = [e for e in extra if e.mint not in have] + signals
+        signals = signals[:MAX_DISCOVERED_TOKENS]
+        res.sources["manual"] = len(extra)
+    res.signals = len(signals)
+    if not signals:
+        res.finished_at = time.time()
+        return res
+    sig_map = {s.mint: s for s in signals}
+    addrs = [s.mint for s in signals]
+    hints = [s.mint for s in signals if s.is_hint]
+
+    # 2) بيانات الأزواج
+    await say(f"📊 (2/4) جلب بيانات {len(addrs)} عقد من القناة...")
+    sink: dict = {}
+    try:
+        await asyncio.wait_for(fetch_pairs(client, addrs, hints, sink), timeout=min(35.0, left()))
+    except asyncio.TimeoutError:
+        log.warning("fetch_pairs timed out (partial=%d)", len(sink))
+    pairs = list(sink.values())
+    res.discovered = len(pairs)
+
+    pre = []
+    matched: set = set()
+    for p in pairs:
+        m = extract_metrics(p)
+        if m is None:
+            res.stats["بيانات ناقصة"] += 1
+            continue
+        sig = sig_map.get(m["mint"]) or sig_map.get(m["pair"])
+        if sig:
+            m["signal_ts"], m["signal_post"], m["signal_manual"] = sig.ts, sig.post_id, sig.manual
+            matched.add(sig.mint)
+        reason = pre_filter(m)
+        if reason:
+            kind = watch_kind_for(reason)
+            if kind in ("young", "bonding"):          # الفحص الأمني غير ممكن/مبكر → مراقبة ثم فحص تلقائي
+                res.stats[reason] += 1
+                res.watch.append((m, None, kind))
+                set_v(m, "👁", reason_detail(m, reason) + " — أُضيفت للمراقبة وسأعيد فحصها تلقائياً")
+            elif kind in ("dip", "extended"):         # تمر على الفحص الأمني ثم تُراقب (لا دخول فوري)
+                m["watch_kind"], m["watch_reason"] = kind, reason_detail(m, reason)
+                pre.append(m)
+            else:
+                res.stats[reason] += 1
+                set_v(m, "❌", reason_detail(m, reason))
+        else:
+            pre.append(m)
+    res.unresolved = [s.mint for s in signals if s.mint not in matched]
+    if pairs and len(signals) > len(matched):
+        res.stats["عقد بلا زوج على DexScreener (جديد جداً أو ليس عملة)"] += len(signals) - len(matched)
+    res.after_prefilter = len(pre)
+    pre.sort(key=prelim_rank, reverse=True)
+    for m in pre[MAX_SECURITY_CHECKS:]:
+        set_v(m, "⏭️", f"لم يُفحص أمنياً (حد الفحص {MAX_SECURITY_CHECKS} عملة) — ليس حكماً على العملة")
+    pre = pre[:MAX_SECURITY_CHECKS]
+
+    # 3) الأمان
+    await say(f"🛡️ (3/4) فحص أمان {len(pre)} عملة عبر RugCheck...")
+    sem = asyncio.Semaphore(4)
+
+    async def check(m: dict):
+        async with sem:
+            report = await get_rugcheck_report(client, m["mint"])
+        return m, (analyze_security(report, m["pair"]) if report else None)
+
+    task_map = {asyncio.create_task(check(m)): m for m in pre}
+    tasks = list(task_map)
+    secure: list = []
+    if tasks:
+        done, pending = await asyncio.wait(tasks, timeout=max(5.0, min(45.0, left() - 25)))
+        for t in pending:
+            t.cancel()
+            set_v(task_map[t], "⏱️", "انتهت مهلة RugCheck — لم تُفحص (ليس حكماً على العملة)")
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+            res.stats["انتهت مهلة فحص RugCheck (لم تُفحص)"] += len(pending)
+        for t in done:
+            if t.cancelled() or t.exception() is not None:
+                res.stats["خطأ أثناء فحص RugCheck"] += 1
+                set_v(task_map[t], "⚠️", "خطأ أثناء فحص RugCheck — ليس حكماً على العملة")
+                continue
+            m, sec = t.result()
+            if sec is not None:
+                res.secs[m['mint']] = sec
+            if sec is None:
+                res.stats["تعذر جلب تقرير RugCheck"] += 1
+                set_v(m, "⚠️", "تعذر جلب تقرير RugCheck (حد طلبات/غير مفهرسة) — ليس حكماً على العملة")
+            elif not sec.passed:
+                for r in sec.reasons:
+                    res.stats[r] += 1
+                set_v(m, "🛡️", sec_detail(sec))
+            elif m.get("watch_kind"):
+                res.watch.append((m, sec, m["watch_kind"]))
+                set_v(m, "👁", f"{m['watch_reason']} — اجتازت الأمان وأُضيفت للمراقبة بانتظار ارتداد مؤكد")
+            else:
+                secure.append((m, sec))
+    res.after_security = len(secure)
+
+    # 4) الخطط
+    await say(f"📈 (4/4) تحليل {len(secure)} عملة آمنة وبناء الخطط...")
+    secure.sort(key=lambda ms: prelim_rank(ms[0]), reverse=True)
+    candle_map: dict = {}
+    top = [m for m, _ in secure[:MAX_CANDLE_FETCH]]
+    if top and left() > 6:
+        csem = asyncio.Semaphore(2)
+
+        async def get_candles(m: dict) -> list:
+            async with csem:
+                c = await fetch_candles(client, m["pair"], candle_tf(m["age_min"]))
+                await asyncio.sleep(0.6)
+                return c
+
+        ctasks = {m["mint"]: asyncio.create_task(get_candles(m)) for m in top}
+        done, pending = await asyncio.wait(ctasks.values(), timeout=max(4.0, left() - 3))
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for mint, t in ctasks.items():
+            if t in done and not t.cancelled() and t.exception() is None:
+                candle_map[mint] = t.result()
+
+    ranked: list = []
+    for m, sec in secure:
+        res.watch.append((m, sec, "nosetup"))          # كل عملة آمنة تُراقب لارتداد مؤكد
+        candles = candle_map.get(m["mint"], [])
+        plans = []
+        scalp_reason = None
+        if candles:
+            tf = candle_tf(m["age_min"])
+            plan, reject = compute_scalp_plan(candles, m["price"], tf)
+            if plan is not None and plan.status != "WAIT":
+                plans.append(plan)
+            elif reject:
+                res.stats[reject] += 1
+                scalp_reason = reject
+                if reject.startswith("شموع غير كافية"):
+                    scalp_reason = f"{reject} ({len(candles)}/{fib_params(tf)[0]} شمعة {tf}د)"
+            else:
+                scalp_reason = "السعر بعيد فوق المنطقة الذهبية (انتظر تصحيحاً)"
+        if momentum_ok(m):
+            plans.append(compute_alt_plan("MOMENTUM", m, candles))
+        if hold_ok(m):
+            plans.append(compute_alt_plan("HOLD", m, candles))
+        if not plans:
+            res.stats["لا تطابق أي نمط (سكالبيج/زخم/احتفاظ)"] += 1
+            detail = (
+                f"اجتازت الأمان لكن بلا نمط دخول — 1h {m['chg1']:+.0f}% • 5د {m['chg5']:+.0f}% • "
+                f"وتيرة الفوليوم {m['vol_pace']:.1f}x • شراء 5د {m['buy_ratio5'] * 100:.0f}%"
+            )
+            detail += f" • سكالبيج: {scalp_reason}" if scalp_reason else " • سكالبيج: لم تُجلب شموع"
+            set_v(m, "👁", detail + " — في المراقبة بانتظار ارتداد")
+            continue
+        for plan in plans:
+            score, breakdown = compute_score(m, sec, plan)
+            ranked.append(Candidate(m, sec, plan, score, breakdown))
+
+    ranked.sort(key=lambda c: c.score, reverse=True)
+    res.ranked = ranked
+    for c in ranked:
+        v = res.verdicts.get(c.m["mint"])
+        if v is None or v["icon"] != "✅":
+            fl = market_flags(c.m)
+            set_v(c.m, "✅", f"Score {c.score} — {KIND_SHORT[c.plan.kind]} ({grade_of(c)})" + (" ⚠️ " + "، ".join(fl) if fl else ""))
+    res.finished_at = time.time()
+    return res
+
+
+# ───────────────────────────── تنسيق الرسائل ─────────────────────────────
+
+
+def format_best(c: Candidate, alts: list) -> str:
+    m, s, p = c.m, c.sec, c.plan
+    name, sym = html.escape(m["name"]), html.escape(m["symbol"])
+    grade = grade_of(c)
+
+    def mc(price: float) -> str:
+        return fmt_usd(m["mcap"] * price / m["price"])
+
+    tp1_pct = (p.tp1 / p.entry - 1) * 100
+    tp2_pct = (p.tp2 / p.entry - 1) * 100
+    risky = bool(s.warnings)
+    dev_txt = f"{s.dev:.1f}%" if s.dev is not None else "غير متاح"
+    rug_txt = f"خطورة {s.rug_norm:.0f}/100" if s.rug_norm is not None else f"raw {s.rug_raw:.0f}"
+    bundle_txt = "🚨 مرصودة أنماط Bundled/Insider" if s.bundled else "✅ لا يوجد"
+    b = c.breakdown
+
+    head = (
+        f"{grade} — <b>صفقة {html.escape(KIND_LABEL[p.kind])}</b>\n"
+        f"📊 التقييم: <b>{c.score}/100</b>\n\n"
+    )
+    warn_block = ""
+    flags = market_flags(m)
+    if risky or flags:
+        items = list(s.warnings) + flags
+        note = (
+            "اجتازت الحظر الصلب (Mint/Freeze/LP/Danger) لكنها ليست نظيفة — حجم صغير جداً."
+            if risky
+            else "اجتازت الحظر الصلب، لكنها صغيرة/حديثة: فرصة أكبر ومخاطرة أعلى — قلّل حجم الصفقة."
+        )
+        warn_block = "🚨 <b>تحذيرات:</b> " + " • ".join(html.escape(w) for w in items) + f"\n<i>{note}</i>\n\n"
+
+    ident = (
+        f"🪙 <b>{name}</b> (${sym})\n"
+        f"📋 العقد CA (اضغط للنسخ):\n<code>{m['mint']}</code>\n\n"
+    )
+
+    safety = (
+        f"🛡️ <b>الأمان والسيولة</b>\n"
+        f"• Mint ✅ ملغاة | Freeze ✅ ملغاة\n"
+        f"• LP: {s.lp_locked:.0f}% محروقة/مقفولة 🔒\n"
+        f"• RugCheck: {rug_txt}\n"
+        f"• السيولة: {fmt_usd(m['liq'])} | MC: {fmt_usd(m['mcap'])} | Liq/MC: {m['liq_mcap'] * 100:.1f}%\n"
+        f"• 🐋 Top10: {s.top10:.1f}% | Dev: {dev_txt} | Bundles: {bundle_txt}\n\n"
+        f"⚡ <b>الزخم</b>: 5m {m['chg5']:+.1f}% | 1h {m['chg1']:+.1f}% | 24h {m['chg24']:+.0f}%\n"
+        f"• فوليوم 5m ×{m['vol_pace']:.1f} | ضغط الشراء {m['buy_ratio5'] * 100:.0f}%\n\n"
+    )
+
+    if p.kind == "SCALP":
+        status = (
+            "✅ السعر داخل المنطقة الذهبية الآن"
+            if p.status == "IN_ZONE"
+            else f"⏳ السعر أعلى المنطقة بـ {p.above_pct:.1f}% — انتظر الارتداد (Limit داخل المنطقة)"
+        )
+        plan_txt = (
+            f"📈 <b>الخطة</b>\n{status}\n"
+            f"🟢 Golden Zone (0.5–0.618):\n"
+            f"   <code>{fmt_price(p.zone_low)}</code> ← <code>{fmt_price(p.zone_high)}</code>\n"
+            f"   (MC: {mc(p.zone_low)} ← {mc(p.zone_high)})\n"
+            f"🎯 TP1 (+{tp1_pct:.0f}%): <code>{fmt_price(p.tp1)}</code> | MC {mc(p.tp1)} | Fib 1.272: <code>{fmt_price(p.ext1272)}</code>\n"
+            f"🎯 TP2 (+{tp2_pct:.0f}%): <code>{fmt_price(p.tp2)}</code> | MC {mc(p.tp2)} | Fib 1.618: <code>{fmt_price(p.ext1618)}</code>\n"
+            f"🛑 SL (تحت القاع بـ 1.5%): <code>{fmt_price(p.sl)}</code> | MC {mc(p.sl)}\n"
+            f"⚖️ مخاطرة حتى SL: {p.risk_pct:.1f}% | R:R → TP1 {p.rr1:.2f} / TP2 {p.rr2:.2f}\n"
+            f"📐 Swing: {fmt_price(p.swing_low)} → {fmt_price(p.swing_high)} (+{p.leg_pct:.0f}%)\n\n"
+        )
+    else:
+        note = (
+            "لا تطارد السعر إن ارتفع أكثر من 5% عن منطقة الدخول."
+            if p.kind == "MOMENTUM"
+            else "صفقة أبطأ: راقبها يومياً، ولا تعتمد على شمعة واحدة."
+        )
+        plan_txt = (
+            f"📈 <b>الخطة</b>\n"
+            f"🟢 منطقة الدخول: <code>{fmt_price(p.zone_low)}</code> ← <code>{fmt_price(p.zone_high)}</code>\n"
+            f"   (MC: {mc(p.zone_low)} ← {mc(p.zone_high)})\n"
+            f"🎯 TP1 (+{tp1_pct:.0f}%): <code>{fmt_price(p.tp1)}</code> | MC {mc(p.tp1)}\n"
+            f"🎯 TP2 (+{tp2_pct:.0f}%): <code>{fmt_price(p.tp2)}</code> | MC {mc(p.tp2)}\n"
+            f"🛑 SL: <code>{fmt_price(p.sl)}</code> | MC {mc(p.sl)}\n"
+            f"⚖️ مخاطرة حتى SL: {p.risk_pct:.1f}% | R:R → TP1 {p.rr1:.2f} / TP2 {p.rr2:.2f}\n"
+            f"<i>{note}</i>\n\n"
+        )
+
+    breakdown = (
+        f"<i>سيولة/MC {b['liq_mcap']:.0f}/20 • فوليوم {b['volume']:.0f}/20 • زخم {b['momentum']:.0f}/10 "
+        f"• دخول {b['fib']:.0f}/25 • أمان {b['safety']:.0f}/25"
+        f"{' • عقوبة −' + str(RISK_PENALTY) if risky else ''}"
+        f"{' • عقوبة سوق −' + str(int(-b.get('market_risk', 0))) if b.get('market_risk') else ''}</i>\n"
+    )
+    links = (
+        f"🔗 <a href=\"https://dexscreener.com/solana/{m['pair']}\">DexScreener</a> • "
+        f"<a href=\"https://rugcheck.xyz/tokens/{m['mint']}\">RugCheck</a>\n"
+    )
+
+    alt_txt = ""
+    if alts:
+        alt_txt = "\n📋 <b>بدائل:</b>\n"
+        for a in alts:
+            alt_txt += (
+                f"• {KIND_SHORT[a.plan.kind]} {html.escape(a.m['name'])} (${html.escape(a.m['symbol'])})"
+                f" — {a.score}/100 {grade_of(a)}\n<code>{a.m['mint']}</code>\n"
+            )
+
+    disclaimer = (
+        "\n⚠️ <i>تحليل آلي وليس نصيحة مالية. لا ضمان للربح — لا تدخل بأكثر مما تتحمل خسارته.</i>"
+    )
+    sig_txt = ""
+    post_id = m.get("signal_post")
+    if m.get("signal_manual") and not post_id:
+        ts = m.get("signal_ts")
+        sig_txt = "📥 <b>المصدر</b>: عقد أرسلتَه يدوياً" + (f" — الإشارة {fmt_age((time.time() - ts) / 60)}" if ts else "") + "\n\n"
+    elif post_id:
+        ts = m.get("signal_ts")
+        age_min = (time.time() - ts) / 60 if ts else None
+        when = fmt_age(age_min) if age_min is not None else "وقت غير معروف"
+        sig_txt = (
+            f"📡 <b>إشارة القناة</b>: {when} — "
+            f"<a href=\"https://t.me/{SIGNAL_CHANNEL}/{post_id}\">الرسالة الأصلية</a>\n"
+        )
+        if age_min is not None and age_min > 120:
+            sig_txt += "<i>الإشارة قديمة نسبياً — اعتمد على السعر والمنطقة الحاليين لا على سعر الإشارة.</i>\n"
+        sig_txt += "\n"
+    return head + warn_block + ident + sig_txt + safety + plan_txt + breakdown + links + alt_txt + disclaimer
+
+
+def format_no_result(res: ScanResult) -> str:
+    lines = [
+        f"🚫 <b>لا توجد صفقة من إشارات @{html.escape(SIGNAL_CHANNEL)} تجتاز الحظر الصلب الآن</b>",
+        "",
+        f"📡 عقود مفحوصة (القناة + يدوي): {res.signals} | وُجد لها زوج: {res.discovered}",
+        f"✅ اجتازت الفلتر الأولي: {res.after_prefilter}",
+        f"🛡️ اجتازت الحظر الأمني الصلب: {res.after_security}",
+    ]
+    if res.stats:
+        lines += ["", "📋 <b>أسباب الاستبعاد:</b>"]
+        for reason, n in res.stats.most_common(12):
+            lines.append(f"• {html.escape(reason)}: {n}")
+    lines += ["", "💡 جرّب /diag لتشخيص قراءة القناة، أو انتظر إشارات جديدة ثم أعد المحاولة."]
     return "\n".join(lines)
 
 
-def build_report(mint: str, name: str, symbol: str, origin: dict, dev: dict,
-                  holders: dict, security: dict, momentum: dict, rating: dict,
-                  scalp: Optional[dict] = None) -> str:
-
-    dev_line = green_red(dev.get("dev_sold"), "باع كل حصته", f"ما زال يملك {dev.get('dev_pct', 0) or 0:.1f}%")
-    top10_line = NA
-    if holders["top10_pct"] is not None:
-        tag = "🟢 موزعة جيداً" if holders["top10_pct"] <= 25 else "🔴 تجميع خطير"
-        top10_line = f"{holders['top10_pct']:.1f}% من الإمداد [{tag}]"
-    snipers_line = "تم التخلص منهم ✅" if holders["bundled"] is False else ("ما زالوا يتحكمون ⚠️" if holders["bundled"] else NA)
-
-    mint_line = green_red(security["mint_disabled"], "ملغاة", "مفعلة - خطر")
-    freeze_line = green_red(security["freeze_disabled"], "ملغاة", "مفعلة - خطر")
-    lp_line = f"{security['lp_locked_pct']:.0f}%" if security["lp_locked_pct"] is not None else NA
-    rc_score_line = f"{security['rugcheck_score']}" if security["rugcheck_score"] is not None else NA
-
-    bs_ratio = NA
-    if momentum["buys_5m"] is not None and momentum["sells_5m"] is not None:
-        bratio = momentum["buys_5m"] / max(momentum["sells_5m"], 1)
-        bs_ratio = f"{momentum['buys_5m']} شراء / {momentum['sells_5m']} بيع (النسبة: {bratio:.1f})"
-
-    report = f"""
-🪙 *{name}* (${symbol})
-📍 *المصدر:* {origin['source']}
-💰 *السعر الحالي:* {fmt_price(momentum['price'])} | *القيمة السوقية:* {fmt_usd(momentum['mcap'])} | *السيولة:* {fmt_usd(momentum['liq_usd'])}
-⏱ *عمر العملة:* {age_from_ms(momentum['pair_age_ms'])}
-
-👑 *تحليل المطور والحيتان (Dev & Holders):*
-• *المطور (Dev):* {dev_line}
-• *أكبر 10 كبار الملاك (Top 10):* {top10_line}
-• *القناصة (Snipers/Bundles):* {snipers_line}
-
-🛡 *الأمان والسيولة (RugCheck):*
-• *خاصية السك (Mint):* {mint_line}
-• *خاصية التجميد (Freeze):* {freeze_line}
-• *حرق/قفل السيولة (LP):* {lp_line}
-• *تقييم RugCheck الخام:* {rc_score_line}
-
-📈 *الحركة وحجم التداول:*
-• *حجم التداول (5 د):* {fmt_usd(momentum['vol_5m'])} | *(1 س):* {fmt_usd(momentum['vol_1h'])}
-• *العمليات (5 د):* {bs_ratio}
-• *تغيّر السعر:* 5د {fmt_pct(momentum['change_5m'], signed=True)} | 1س {fmt_pct(momentum['change_1h'], signed=True)}
-
-🎯 *التقييم النهائي: {rating['total']}/100*
-• *التوصية:* {rating['verdict']}
-• *السبب الرئيسي:* {rating['main_reason']}
-
-{build_scalp_section(rating, scalp)}
-
-`{mint}`
-
-⚠️ _هذا تحليل آلي لأغراض المعلومات فقط، وليس توصية مالية مضمونة. القرار والمسؤولية ترجع لك بالكامل._
-""".strip()
-    return report
+def format_verdicts(res: ScanResult, limit: int = 14) -> str:
+    items = sorted(res.verdicts.values(), key=lambda v: (0 if v["icon"] == "✅" else 1, -v["mcap"]))
+    total = len(items) + len(res.unresolved)
+    lines = [f"📋 <b>تقرير كل عقد ({total})</b>", ""]
+    for v in items[:limit]:
+        lines.append(f"{v['icon']} <b>{html.escape(v['sym'])}</b> ({fmt_usd(v['mcap'])}) — {html.escape(v['text'])}")
+    room = max(0, limit - len(items))
+    for a in res.unresolved[:room]:
+        lines.append(f"❔ <code>{a[:5]}…{a[-4:]}</code> — لا بيانات سوق من DexScreener/GeckoTerminal (جديدة جداً أو غير مدرجة)")
+    shown = min(len(items), limit) + min(len(res.unresolved), room)
+    if total > shown:
+        lines.append(f"… و{total - shown} أخرى")
+    lines += ["", "💡 كل حد أعلاه قابل للتعديل من متغيرات البيئة (MIN_PAIR_AGE_MIN، MIN_LIQUIDITY_USD، MIN_VOLUME_H1_USD…)."]
+    return "\n".join(lines)
 
 
-# ------------------------------------------------------------------------- #
-#  منطق التحليل الكامل لعملة واحدة
-# ------------------------------------------------------------------------- #
-
-async def analyze_mint(address: str) -> str:
-    async with aiohttp.ClientSession() as session:
-        dex, rug, pump = await asyncio.gather(
-            fetch_dexscreener(session, address),
-            fetch_rugcheck(session, address),
-            fetch_pumpfun(session, address),
-        )
-
-        # Universal Data Fallback: العملة جد جديدة وما وصلتش بعد لـ DexScreener
-        # (أو المستخدم دخل عنوان عملة ما نجحش يتربط ببركة) -> نجرب GeckoTerminal.
-        used_fallback = False
-        if not dex:
-            dex = await fetch_geckoterminal(session, address)
-            used_fallback = dex is not None
-
-        if not dex and not rug and not pump:
-            return (
-                "⚠️ ما قدرتش نلقى أي بيانات لهذا العقد.\n"
-                "تأكد من صحة العنوان (Token Mint أو Pair Address)، أو العملة جد جديدة "
-                "وما زالت البيانات ما توصلتش لأي مصدر بعد."
-            )
-
-        # ثغرة حقيقية انصلحت: إذا DexScreener وGeckoTerminal فشلوا الاثنين
-        # (ما كاين سعر ولا سيولة ولا حجم) لكن RugCheck نجح، كان الكود قبل
-        # يكمّل ويحسب تقييم كامل من 100 رغم إن 35 نقطة (سيولة+حجم) ما تنحسبش
-        # أصلاً = تقييم منخفض بشكل مضلل ("41/100 خطر") سببه نقص بيانات، مو
-        # خطر حقيقي بالعملة. دابا نوقف هنا ونوضح الوضع بصراحة بدل رقم كاذب.
-        if not dex:
-            name_only = safe_get(rug, "tokenMeta", "name", default=None) or safe_get(pump, "name", default=None)
-            return (
-                f"⚠️ {('عملة ' + name_only) if name_only else 'هذي العملة'} ما عندها بيانات سعر أو سيولة أو حجم "
-                "تداول متوفرة حالياً (DexScreener وGeckoTerminal ما لقوش بركة نشطة لها).\n\n"
-                "هذا يصير عادة إذا: العملة جد جديدة وما تسجلتش في الفهرسة بعد، أو بعثت عنوان العملة "
-                "(Token Mint) مكان عنوان البركة (Pair) أو العكس.\n\n"
-                "ما نقدرش نعطي تقييماً موثوقاً أو خطة سكالبينغ بلا بيانات السعر والسيولة. "
-                "جرّب بعد شوية، أو تأكد من العنوان."
-            )
-
-        name = (
-            safe_get(dex, "baseToken", "name", default=None)
-            or safe_get(pump, "name", default=None)
-            or "عملة غير معروفة"
-        )
-        symbol = (
-            safe_get(dex, "baseToken", "symbol", default=None)
-            or safe_get(pump, "symbol", default=None)
-            or "???"
-        )
-
-        origin = analyze_origin(dex, pump)
-        dev = analyze_dev(rug, pump)
-        holders = analyze_holders(rug)
-        security = analyze_security(rug)
-        momentum = analyze_momentum(dex)
-        rating = compute_score(security, holders, momentum, dev)
-
-        # خطة السكالبينغ تحتاج قاع سعري حقيقي؛ نجيبه فقط إذا التقييم يستاهل
-        # (يوفر طلبات شبكة غير ضرورية على العملات الضعيفة أصلاً). عملة بتركيز
-        # مرتفع لكن بزخم قوي مؤكد (reduced_size) تستاهل خطة مصغّرة حتى لو
-        # التقييم الخام ما وصلش SCALP_MIN_SCORE، لأن عقوبة التركيز نزّلته
-        # صناعياً رغم إن الزخم يعوّضها جزئياً.
-        scalp = None
-        eligible = (rating["total"] >= SCALP_MIN_SCORE or rating.get("reduced_size")) \
-            and not rating.get("hard_block") and not rating.get("caution_block")
-        if eligible and momentum["price"]:
-            swing = await fetch_swing_wave(session, momentum.get("pair_address"))
-            scalp = compute_scalp_plan(momentum["price"], swing, momentum["liq_usd"], momentum.get("mcap"))
-
-    if used_fallback:
-        log.info("Used GeckoTerminal fallback for %s", address)
-
-    return build_report(address, name, symbol, origin, dev, holders, security, momentum, rating, scalp)
+def format_no_signals(res: ScanResult) -> str:
+    info = res.sources if isinstance(res.sources, dict) else {}
+    lines = [f"📡 <b>لم أجد عقوداً صالحة في قناة @{html.escape(SIGNAL_CHANNEL)}</b>", ""]
+    if info.get("error"):
+        lines.append(f"⚠️ {html.escape(str(info['error']))}")
+    else:
+        lines.append(f"• رسائل مقروءة: {info.get('messages', 0)} | وصلنا لرسائل أقدم من {SIGNAL_MAX_AGE_HOURS:.0f}h: {'نعم' if info.get('expired') else 'لا'}")
+        lines.append(f"• رسائل فيها عقود: {info.get('with_addr', 0)}")
+    lines += ["", "📥 <b>الوضع اليدوي</b>: حوّل لي (Forward) رسائل الإشارات من القناة، أو الصق العقود هنا، ثم أرسل /best."]
+    if not TG_SESSION:
+        lines += ["🔑 (للقراءة التلقائية: TELETHON_SESSION بجلسة حساب مستخدم.)"]
+    lines += ["", "💡 جرّب /diag للتفاصيل، أو ارفع SIGNAL_MAX_AGE_HOURS إن كانت إشارات القناة قليلة."]
+    return "\n".join(lines)
 
 
-# ------------------------------------------------------------------------- #
-#  معالجات تيليغرام
-# ------------------------------------------------------------------------- #
+def to_plain(text: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "👋 أهلاً بك في *Solana Deep Scan & Scalp Bot v2.0*.\n\n"
-        "ابعثلي عنوان عملة (Token Mint) أو عنوان بركة (Pair/Pool Address) على "
-        "Pump.fun أو Raydium، ونرجّعلك تقرير تحليل كامل: الأمان، المطوّر، "
-        "الحاملين، والحجم — وإذا كانت العملة قوية، خطة سكالبينغ جاهزة.\n\n"
-        "مثال:\n`EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`",
-        parse_mode=ParseMode.MARKDOWN,
+
+# ───────────────────────────── أوامر تلغرام ─────────────────────────────
+
+WELCOME = (
+    "🎯 <b>SolAlpha Sniper</b>\n\n"
+    "يقرأ آخر إشارات قناة @solhousesignal ويفحص عقودها، ثم يعطيك أفضل صفقة متاحة مع نوعها (سكالبيج / زخم / احتفاظ).\n\n"
+    "• /best — أفضل صفقة من إشارات القناة + بدائل\n"
+    "• أرسل لي عقداً (أو حوّل رسالة إشارة من القناة) ثم /best لتحليله\n"
+    "• /clear — مسح العقود التي أرسلتها\n"
+    "• /best يحلل العقود الجديدة فقط؛ السابقة تبقى تحت المراقبة دون إعادة تحليل (/best all لإعادة تحليل الكل)\n"
+    "• /watchlist — العملات تحت المراقبة • /unwatch — مسحها\n"
+    "• /report — تقرير نتائج الصفقات (آخر 24 ساعة) مع أسباب الفشل وملف تفاصيل\n"
+    "• /diag — تشخيص قراءة القناة (Telethon)\n"
+    "• /help — شرح الأنواع والفلاتر\n\n"
+    "⚠️ أداة تحليل وليست نصيحة مالية."
+)
+
+HELP = (
+    "👁 <b>المراقبة</b>: كل عملة آمنة (وكذلك الحديثة جداً، التي على Bonding Curve، الهابطة، أو التي صعدت كثيراً) تدخل قائمة المراقبة، "
+    "وأنبّهك عند ارتداد مؤكد بعد تصحيح، أو عند نضجها/هجرتها واجتيازها الفحص الأمني.\n\n"
+    "📥 <b>الوضع اليدوي</b>: الصق عنوان عقد أو حوّل (Forward) رسالة إشارة إلى البوت، ثم أرسل /best. "
+    f"تبقى العقود {MANUAL_TTL_HOURS:.0f} ساعة أو حتى /clear.\n\n"
+    f"📡 <b>المصدر</b>: عقود آخر رسائل @{SIGNAL_CHANNEL} فقط (آخر {SIGNAL_MAX_AGE_HOURS:.0f} ساعة) — لا مسح عشوائي للسوق.\n\n"
+    "📋 بعد كل /best تصلك رسالة «تقرير كل عقد» بسبب قبول/رفض كل عملة بالأرقام.\n\n"
+    f"🔎 <b>فلتر أولي</b>: سيولة ≥ {fmt_usd(MIN_LIQUIDITY_USD)} • MC ≥ {fmt_usd(MIN_MCAP_USD)} • عمر ≥ {MIN_PAIR_AGE_MIN:.0f}د — وما دون {fmt_usd(FLAG_LIQ_USD)} سيولة أو {FLAG_AGE_MIN:.0f}د عمر يُقبل بتحذير وعقوبة.\n\n"
+    "🛡️ <b>حظر صلب دائماً</b>: Mint/Freeze ملغاتان • LP محروقة/مقفولة • ليست Rugged • لا Danger في RugCheck.\n\n"
+    f"🧼 <b>المستوى A (نظيف)</b>: Dev ≤ {MAX_DEV_PCT:.0f}% • Top10 ≤ {MAX_TOP10_PCT:.0f}% • بلا Bundled/Insider • RugCheck Good.\n"
+    "⚠️ <b>المستوى B</b>: يظهر مع تحذيرات صريحة وعقوبة في التقييم.\n\n"
+    "<b>الأنواع</b>\n"
+    "⚡ سكالبيج: دخول من Golden Zone، TP +18%/+25%\n"
+    "🚀 زخم: صعود بفوليوم متسارع أو اندفاع سعري بسيطرة مشترين، TP +15%/+30%\n"
+    "🧭 احتفاظ: عملة 24h+ بسيولة وفوليوم جيدين، TP +50%/+100%\n\n"
+    f"🟢 قوية: A وScore ≥ {MIN_SCORE:.0f} • 🟡 متوسطة: ≥ {RISKY_MIN_SCORE:.0f} • 🟠 ضعيفة: أقل."
+)
+
+
+async def post_init(application: Application) -> None:
+    application.bot_data["http"] = httpx.AsyncClient(
+        timeout=httpx.Timeout(12.0),
+        headers={"User-Agent": "SolAlphaSniper/4.0", "Accept": "application/json"},
+        follow_redirects=True,
+    )
+    application.bot_data["scan_lock"] = asyncio.Lock()
+    application.bot_data["cooldowns"] = {}
+    application.bot_data["last_scan"] = None
+    application.bot_data["watch"] = load_watch()
+    application.bot_data["track"] = load_track()
+    TL["client"], TL["error"] = await create_telethon()
+
+
+async def post_shutdown(application: Application) -> None:
+    client = application.bot_data.get("http")
+    if client:
+        await client.aclose()
+    if TL.get("client"):
+        try:
+            await TL["client"].disconnect()
+        except Exception:
+            pass
+
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(WELCOME, parse_mode=ParseMode.HTML)
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(HELP, parse_mode=ParseMode.HTML)
+
+
+def _cooldown_wait(bd: dict, user_id: int) -> int:
+    now = time.time()
+    last = bd["cooldowns"].get(user_id, 0)
+    if now - last < USER_COOLDOWN_SEC:
+        return int(USER_COOLDOWN_SEC - (now - last)) + 1
+    bd["cooldowns"][user_id] = now
+    return 0
+
+
+async def safe_edit(status_msg, original_msg, text: str) -> None:
+    """يضمن وصول الرد دائماً: HTML ثم نص عادي ثم رسالة جديدة."""
+    try:
+        await status_msg.edit_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        return
+    except Exception:
+        log.exception("HTML edit failed")
+    plain = to_plain(text)[:4000]
+    try:
+        await status_msg.edit_text(plain, disable_web_page_preview=True)
+        return
+    except Exception:
+        log.exception("Plain edit failed")
+    try:
+        await original_msg.reply_text(plain, disable_web_page_preview=True)
+    except Exception:
+        log.exception("Reply failed")
+
+
+async def safe_send(msg, text: str) -> None:
+    try:
+        await msg.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except Exception:
+        log.exception("HTML send failed")
+        try:
+            await msg.reply_text(to_plain(text)[:4000], disable_web_page_preview=True)
+        except Exception:
+            log.exception("Plain send failed")
+
+
+# ───────────────────────────── المراقبة: انتظار الارتداد وتنبيهك ─────────────────────────────
+WATCH_INTERVAL_SEC = _env_float("WATCH_INTERVAL_SEC", 45)
+WATCH_TTL_HOURS = _env_float("WATCH_TTL_HOURS", 8)
+WATCH_MAX_PER_USER = int(_env_float("WATCH_MAX_PER_USER", 30))
+WATCH_CANDLES_PER_CYCLE = int(_env_float("WATCH_CANDLES_PER_CYCLE", 6))
+WATCH_SEC_PER_CYCLE = int(_env_float("WATCH_SEC_PER_CYCLE", 4))
+BOUNCE_MIN_PCT = _env_float("BOUNCE_MIN_PCT", 4)          # أقل ارتداد من القاع لاعتباره بدأ
+BOUNCE_MAX_PCT = _env_float("BOUNCE_MAX_PCT", 25)         # أكثر منه = فات الدخول المبكر
+BOUNCE_MIN_RETRACE = _env_float("BOUNCE_MIN_RETRACE", 0.382)
+BOUNCE_SL_BUFFER = 0.02
+WATCH_FILE = os.getenv("WATCH_FILE", "watchlist.json")
+WATCH_DEAD_PCT = _env_float("WATCH_DEAD_PCT", 75)   # انهيار منذ الإضافة يُسقطها من المراقبة
+
+WATCH_KIND_TXT = {
+    "young": "⏳ حديثة — بانتظار نضج البيانات",
+    "bonding": "⏳ على Bonding Curve — بانتظار الهجرة",
+    "dip": "📉 هابطة — بانتظار قاع وارتداد",
+    "extended": "📈 صعدت كثيراً — بانتظار تصحيح",
+    "nosetup": "👁 آمنة — بانتظار ارتداد",
+}
+
+
+def watch_kind_for(reason: str) -> Optional[str]:
+    if reason == "عمر الزوج قصير جداً":
+        return "young"
+    if reason.startswith("لم تهاجر"):
+        return "bonding"
+    if reason == "انهيار حاد في السعر":
+        return "dip"
+    if reason.startswith("ارتفاع مفرط"):
+        return "extended"
+    return None
+
+
+def sec_brief(sec: "Security") -> str:
+    parts = [f"Top10 {sec.top10:.0f}%"]
+    if sec.dev is not None:
+        parts.append(f"Dev {sec.dev:.1f}%")
+    if sec.lp_locked is not None:
+        parts.append(f"LP {sec.lp_locked:.0f}%")
+    if sec.rug_norm is not None:
+        parts.append(f"RugCheck {sec.rug_norm:.0f}/100")
+    return " • ".join(parts)
+
+
+def save_watch(bd: dict) -> None:
+    try:
+        tmp = WATCH_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(list(bd.get("watch", {}).values()), f, ensure_ascii=False)
+        os.replace(tmp, WATCH_FILE)
+    except Exception as e:
+        log.warning("save_watch failed: %s", e)
+
+
+def load_watch() -> dict:
+    try:
+        with open(WATCH_FILE, encoding="utf-8") as f:
+            return {it["key"]: it for it in json.load(f)}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        log.warning("load_watch failed: %s", e)
+        return {}
+
+
+def add_watch(bd: dict, uid: int, chat_id: int, entries: list) -> list:
+    store = bd.setdefault("watch", {})
+    added = []
+    for m, sec, kind in entries:
+        key = f"{uid}:{m['mint']}"
+        if key in store:
+            continue
+        mine = [k for k, it in store.items() if it["uid"] == uid]
+        if len(mine) >= WATCH_MAX_PER_USER:
+            store.pop(min(mine, key=lambda k: store[k]["added"]), None)
+        store[key] = {
+            "key": key, "uid": uid, "chat": chat_id, "mint": m["mint"], "pair": m["pair"],
+            "sym": m["symbol"], "name": m["name"], "kind": kind,
+            "mcap0": m["mcap"], "price0": m["price"], "price": m["price"], "mcap": m["mcap"], "dex": m["dex"],
+            "factor": (m["mcap"] / m["price"]) if m["price"] > 0 else 0.0,
+            "added": time.time(), "sec_ok": True if sec is not None else None,
+            "sec_txt": sec_brief(sec) if sec is not None else "", "setup": None, "alerted": [],
+            "candle_ts": 0.0, "sec_tries": 0, "why": "",
+        }
+        added.append(store[key])
+    if added:
+        save_watch(bd)
+    return added
+
+
+def format_watch_added(added: list) -> str:
+    lines = [f"👁 <b>أضفت {len(added)} عملة لقائمة المراقبة</b>", ""]
+    for it in added[:8]:
+        lines.append(f"• <b>{html.escape(it['sym'])}</b> ({fmt_usd(it['mcap'])}) — {WATCH_KIND_TXT.get(it['kind'], '')}")
+    if len(added) > 8:
+        lines.append(f"… و{len(added) - 8} أخرى")
+    lines += [
+        "",
+        "سأنبّهك هنا عندما:",
+        "• 🔔 يتأكد ارتداد (قاع + شمعتان خضراوان + ضغط شراء) مع الدخول/الأهداف/الوقف",
+        "• ✅ تنضج العملة الحديثة أو تهاجر وتجتاز الفحص الأمني",
+        "• 🎯🛑 تتحقق الأهداف أو يُضرب الوقف",
+        "",
+        "/watchlist لعرضها • /unwatch لمسحها",
+    ]
+    return "\n".join(lines)
+
+
+def detect_bounce(candles: list, m: dict):
+    """يكشف ارتداداً مؤكداً بعد موجة صاعدة وتصحيح. يرجع (setup|None، سبب_عدم_الإشارة)."""
+    if len(candles) < 30:
+        return None, f"شموع قليلة ({len(candles)})"
+    w = candles[:-1][-120:]                       # شموع مغلقة فقط
+    price = m["price"]
+    hi_i = max(range(len(w)), key=lambda i: w[i][2])
+    peak = w[hi_i][2]
+    if hi_i > len(w) - 6:
+        return None, "القمة حديثة — لم يبدأ التصحيح بعد"
+    leg_low = min(c[3] for c in w[max(0, hi_i - 60): hi_i + 1])
+    if leg_low <= 0 or (peak / leg_low - 1) * 100 < MIN_LEG_PCT:
+        return None, "لا موجة صاعدة واضحة قبل القمة"
+    after = w[hi_i + 1:]
+    k = min(range(len(after)), key=lambda i: after[i][3])
+    trough = after[k][3]
+    tr_i = hi_i + 1 + k
+    if tr_i > len(w) - 3:
+        return None, "القاع حديث جداً — ما زال يهبط أو لم يتأكد"
+    retr = (peak - trough) / (peak - leg_low) if peak > leg_low else 0.0
+    if retr < BOUNCE_MIN_RETRACE:
+        return None, f"تصحيح ضحل ({retr:.0%})"
+    if trough < leg_low * 0.9:
+        return None, "هبط تحت بداية الموجة بوضوح — فشل الهيكل"
+    bounce = (price / trough - 1) * 100
+    if bounce < BOUNCE_MIN_PCT:
+        return None, f"لم يرتدّ بعد (+{bounce:.1f}% من القاع)"
+    if bounce > BOUNCE_MAX_PCT:
+        return None, f"ارتد كثيراً (+{bounce:.0f}%) — فات الدخول المبكر"
+    greens = sum(1 for c in w[-3:] if c[4] > c[1])
+    if greens < 2:
+        return None, "لا شمعتان خضراوان من آخر ثلاث"
+    if m["buy_ratio5"] < 0.5:
+        return None, f"ضغط البيع أعلى (شراء {m['buy_ratio5'] * 100:.0f}%)"
+    sl = trough * (1 - BOUNCE_SL_BUFFER)
+    risk_pct = (price - sl) / price * 100
+    if risk_pct <= 0 or risk_pct > MAX_SL_RISK_PCT:
+        return None, f"وقف الخسارة بعيد ({risk_pct:.0f}%)"
+    tp1 = trough + 0.382 * (peak - trough)
+    tp2 = trough + 0.618 * (peak - trough)
+    if tp1 < price * 1.05:
+        return None, "الهدف الأول قريب جداً من السعر"
+    recent = [c[5] for c in w[-3:]]
+    prev = [c[5] for c in w[-13:-3]]
+    vol_up = bool(prev) and sum(prev) > 0 and (sum(recent) / len(recent)) > 1.2 * (sum(prev) / len(prev))
+    stars = 1 + int(vol_up) + int(m["buy_ratio5"] >= 0.6) + int(bounce <= 12)
+    return {
+        "key": str(int(w[tr_i][0])), "peak": peak, "trough": trough, "leg_low": leg_low, "retr": retr,
+        "bounce": bounce, "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": peak,
+        "risk_pct": risk_pct, "rr1": (tp1 - price) / (price - sl), "rr2": (tp2 - price) / (price - sl),
+        "stars": stars, "vol_up": vol_up, "buy": m["buy_ratio5"], "at": time.time(),
+    }, None
+
+
+def format_bounce_alert(it: dict, m: dict, s: dict) -> str:
+    f = it.get("factor") or ((m["mcap"] / m["price"]) if m["price"] > 0 else 0.0)
+
+    def mc(p: float) -> str:
+        return fmt_usd(p * f) if f else "—"
+
+    stars = "★" * s["stars"] + "☆" * (4 - s["stars"])
+    notes = ["قاع أعلى", "شمعتان خضراوان", f"شراء {s['buy'] * 100:.0f}%"] + (["فوليوم الارتداد أعلى"] if s["vol_up"] else [])
+    return (
+        f"🔔 <b>ارتداد محتمل — {html.escape(it['sym'])}</b>  {stars}\n\n"
+        f"📋 <code>{it['mint']}</code>\n\n"
+        f"📉 القمة {mc(s['peak'])} ← القاع {mc(s['trough'])} (تصحيح {s['retr']:.0%}) ← الآن {mc(s['entry'])} (+{s['bounce']:.0f}% من القاع)\n"
+        f"✅ {' • '.join(notes)}\n\n"
+        f"🟢 دخول: {fmt_price(s['entry'])} | MC {mc(s['entry'])}\n"
+        f"🎯 TP1: {fmt_price(s['tp1'])} (+{(s['tp1'] / s['entry'] - 1) * 100:.0f}%) | MC {mc(s['tp1'])}\n"
+        f"🎯 TP2: {fmt_price(s['tp2'])} (+{(s['tp2'] / s['entry'] - 1) * 100:.0f}%) | MC {mc(s['tp2'])}\n"
+        f"🏁 القمة السابقة: {fmt_price(s['tp3'])} | MC {mc(s['tp3'])}\n"
+        f"🛑 SL: {fmt_price(s['sl'])} (−{s['risk_pct']:.0f}%) | MC {mc(s['sl'])}\n"
+        f"⚖️ R:R → TP1 {s['rr1']:.1f} / TP2 {s['rr2']:.1f}\n"
+        f"🛡️ {html.escape(it.get('sec_txt') or '—')}\n\n"
+        f"🔗 <a href=\"https://dexscreener.com/solana/{m['pair']}\">DexScreener</a> • "
+        f"<a href=\"https://rugcheck.xyz/tokens/{it['mint']}\">RugCheck</a>\n\n"
+        "⚠️ كشف آلي لارتداد بعد تصحيح — لا يضمن استمراره. لا تدخل بأكثر مما تتحمل خسارته."
     )
 
 
-async def handle_mint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    mint = (update.message.text or "").strip()
-    if not SOLANA_MINT_RE.match(mint):
-        await update.message.reply_text(
-            "❌ هذا ما يشبه عنوان عقد سولانا صحيح. تأكد وأعد المحاولة."
-        )
+async def notify(app: Application, it: dict, text: str) -> None:
+    try:
+        await app.bot.send_message(chat_id=it["chat"], text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except Exception:
+        try:
+            await app.bot.send_message(chat_id=it["chat"], text=to_plain(text)[:4000], disable_web_page_preview=True)
+        except Exception:
+            log.exception("notify failed")
+
+
+async def track_setup(app: Application, it: dict, m: dict) -> None:
+    s, p = it.get("setup"), m["price"]
+    if not s:
+        return
+    if time.time() - s["at"] > 4 * 3600:
+        it["setup"] = None
+        return
+    sym = html.escape(it["sym"])
+    if p <= s["sl"]:
+        it["setup"] = None
+        await notify(app, it, f"🛑 <b>{sym}</b>: ضُرب وقف الخسارة ({fmt_price(s['sl'])}). الإعداد فشل — أواصل المراقبة لقاع جديد.")
+    elif p >= s["tp2"]:
+        it["setup"] = None
+        await notify(app, it, f"🎯🎯 <b>{sym}</b>: تحقق TP2 ({fmt_price(s['tp2'])}). فكّر بجني الأرباح/تأمين الباقي.")
+    elif p >= s["tp1"] and not s.get("hit1"):
+        s["hit1"] = True
+        await notify(app, it, f"🎯 <b>{sym}</b>: تحقق TP1 ({fmt_price(s['tp1'])}). فكّر بنقل الوقف إلى نقطة الدخول.")
+
+
+async def evaluate_pending(app: Application, it: dict, m: dict, store: dict) -> None:
+    """عملة حديثة/على Bonding Curve نضجت: فلتر أولي ثم فحص أمني. تُسحب أو تصبح آمنة."""
+    client = app.bot_data["http"]
+    sym = html.escape(it["sym"])
+    reason = pre_filter(m)
+    if reason and watch_kind_for(reason) not in ("dip", "extended"):
+        store.pop(it["key"], None)
+        await notify(app, it, f"🗑 سحبتُ <b>{sym}</b> من المراقبة: {html.escape(reason_detail(m, reason))}")
+        return
+    report = await get_rugcheck_report(client, it["mint"])
+    if not report:
+        it["sec_tries"] += 1
+        if it["sec_tries"] >= 6:
+            store.pop(it["key"], None)
+            await notify(app, it, f"🗑 سحبتُ <b>{sym}</b>: تعذر جلب تقرير RugCheck بعد عدة محاولات.")
+        return
+    sec = analyze_security(report, m["pair"])
+    if not sec.passed:
+        store.pop(it["key"], None)
+        await notify(app, it, f"⛔ <b>{sym}</b> رُفضت أمنياً بعد النضج — {html.escape(sec_detail(sec))}")
+        return
+    it["sec_ok"], it["sec_txt"], it["kind"] = True, sec_brief(sec), "nosetup"
+    await notify(
+        app, it,
+        f"✅ <b>{sym}</b> نضجت واجتازت الفحص الأمني ({html.escape(it['sec_txt'])})\n"
+        f"MC الآن {fmt_usd(m['mcap'])} • 1h {m['chg1']:+.0f}% • 5د {m['chg5']:+.0f}%\n"
+        "أراقبها الآن لارتداد مؤكد.",
+    )
+
+
+async def watch_cycle(app: Application) -> None:
+    bd = app.bot_data
+    store: dict = bd.get("watch") or {}
+    if not store:
+        return
+    client = bd["http"]
+    now = time.time()
+    for key, it in list(store.items()):
+        if now - it["added"] > WATCH_TTL_HOURS * 3600:
+            store.pop(key, None)
+            await notify(app, it, f"⌛ انتهت مراقبة <b>{html.escape(it['sym'])}</b> بعد {WATCH_TTL_HOURS:.0f} ساعات دون إشارة ارتداد.")
+    mints = list({it["mint"] for it in store.values()})
+    if not mints:
+        save_watch(bd)
+        return
+    sink: dict = {}
+    try:
+        await asyncio.wait_for(fetch_pairs(client, mints, (), sink), timeout=40)
+    except asyncio.TimeoutError:
+        log.warning("watch fetch_pairs timed out (partial=%d)", len(sink))
+    metrics = {}
+    for p in sink.values():
+        mm = extract_metrics(p)
+        if mm:
+            metrics[mm["mint"]] = mm
+
+    sec_budget, candle_budget = WATCH_SEC_PER_CYCLE, WATCH_CANDLES_PER_CYCLE
+    for it in sorted(store.values(), key=lambda x: x["candle_ts"]):
+        if store.get(it["key"]) is not it:
+            continue
+        m = metrics.get(it["mint"])
+        if m is None:
+            continue
+        it["price"], it["mcap"], it["dex"], it["pair"] = m["price"], m["mcap"], m["dex"], m["pair"]
+        if it["mcap0"] > 0 and m["mcap"] < it["mcap0"] * (1 - WATCH_DEAD_PCT / 100) and not it.get("setup"):
+            store.pop(it["key"], None)
+            await notify(app, it, (f"☠️ <b>{html.escape(it['sym'])}</b> انهارت أكثر من {WATCH_DEAD_PCT:.0f}% منذ الإضافة "
+                                   f"(MC {fmt_usd(it['mcap0'])} ← {fmt_usd(m['mcap'])}) — أزلتها من المراقبة."))
+            continue
+        if it.get("setup"):
+            await track_setup(app, it, m)
+        if it["sec_ok"] is None:
+            ready = m["dex"] != "pumpfun" and m["age_min"] is not None and m["age_min"] >= MIN_PAIR_AGE_MIN
+            it["why"] = "ينتظر الهجرة" if m["dex"] == "pumpfun" else ("ينتظر نضج البيانات" if not ready else "")
+            if not ready or sec_budget <= 0:
+                continue
+            sec_budget -= 1
+            await evaluate_pending(app, it, m, store)
+            if store.get(it["key"]) is not it or it["sec_ok"] is not True:
+                continue
+        if it.get("setup") or candle_budget <= 0 or m["price"] <= 0:
+            continue
+        candle_budget -= 1
+        it["candle_ts"] = time.time()
+        candles = await fetch_candles(client, m["pair"], 1)
+        setup, why = detect_bounce(candles, m)
+        it["why"] = why or ""
+        if setup and setup["key"] not in it["alerted"]:
+            it["alerted"] = (it["alerted"] + [setup["key"]])[-10:]
+            it["setup"] = setup
+            await notify(app, it, format_bounce_alert(it, m, setup))
+            record_bounce(bd, it, m, setup)
+        await asyncio.sleep(0.5)
+    save_watch(bd)
+
+
+async def watch_loop(app: Application) -> None:
+    await asyncio.sleep(20)
+    while True:
+        try:
+            await watch_cycle(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("watch cycle failed")
+        try:
+            await tracker_cycle(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("tracker cycle failed")
+        await asyncio.sleep(WATCH_INTERVAL_SEC)
+
+
+async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    items = sorted((it for it in context.application.bot_data.get("watch", {}).values() if it["uid"] == uid),
+                   key=lambda x: x["added"])
+    if not items:
+        await update.effective_message.reply_text("قائمة المراقبة فارغة. شغّل /best بعد إرسال عقود، وكل عملة آمنة (أو قابلة للمراقبة) تُضاف تلقائياً.")
+        return
+    lines = [f"👁 <b>قائمة المراقبة ({len(items)})</b>", ""]
+    for it in items[:20]:
+        if it.get("setup"):
+            st = "🟢 إشارة ارتداد نشطة"
+        elif it["sec_ok"] is None:
+            st = WATCH_KIND_TXT.get(it["kind"], "⏳ قيد الفحص")
+        else:
+            st = "👁 آمنة — بانتظار ارتداد"
+        chg = (it["mcap"] / it["mcap0"] - 1) * 100 if it["mcap0"] > 0 else 0.0
+        lines.append(f"• <b>{html.escape(it['sym'])}</b> {fmt_usd(it['mcap0'])} ← {fmt_usd(it['mcap'])} ({chg:+.0f}%) — {st}")
+        if it.get("why") and not it.get("setup"):
+            lines.append(f"   <i>{html.escape(it['why'])}</i>")
+    if len(items) > 20:
+        lines.append(f"… و{len(items) - 20} أخرى")
+    await safe_send(update.effective_message, "\n".join(lines))
+
+
+async def unwatch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    bd = context.application.bot_data
+    uid = update.effective_user.id
+    store = bd.get("watch", {})
+    keys = [k for k, it in store.items() if it["uid"] == uid]
+    for k in keys:
+        store.pop(k, None)
+    save_watch(bd)
+    await update.effective_message.reply_text(f"🧹 أُزيلت {len(keys)} عملة من المراقبة.")
+
+
+# ───────────────────────────── تتبع نتائج الصفقات + تقرير /report ─────────────────────────────
+TRACK_FILE = os.getenv("TRACK_FILE", "tracker.json")
+TRACK_WINDOW_HOURS = _env_float("TRACK_WINDOW_HOURS", 24)     # مدة تتبع كل سجل بعد الإشارة
+TRACK_KEEP_HOURS = 48                                          # أطول مدة نحتفظ فيها بالسجلات
+REPORT_MAX_SETTLE = int(_env_float("REPORT_MAX_SETTLE", 40))   # أقصى عدد سجلات تُحسم بالشموع في التقرير
+
+KEY_LABEL = {
+    "chase": "مطاردة بعد صعود قوي", "pace": "فوليوم يتباطأ", "sell": "ضغط بيع", "liq": "سيولة ضعيفة",
+    "young": "عملة حديثة جداً", "top10": "تركّز كبار الملاك", "fast": "سقوط سريع بعد الدخول",
+    "tight": "وقف ضيق", "flat": "لم تتحرك للأعلى أبداً", "almost": "قريبة من الهدف ثم انعكست",
+    "amb": "وقف وهدف في الدقيقة نفسها", "unknown": "بلا مؤشر واضح",
+}
+KIND_LABEL = {"SCALP": "⚡سكالبيج", "MOMENTUM": "🚀زخم", "HOLD": "🧭احتفاظ", "BOUNCE": "🔔ارتداد", "-": "—"}
+DECISION_LABEL = {"main": "رئيسية", "alt": "بديل", "other": "مرتّبة", "bounce": "ارتداد", "watch": "مراقبة", "rej": "مرفوضة"}
+
+
+def save_track(bd: dict) -> None:
+    try:
+        tmp = TRACK_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(list(bd.get("track", {}).values()), f, ensure_ascii=False)
+        os.replace(tmp, TRACK_FILE)
+    except Exception as e:
+        log.warning("save_track failed: %s", e)
+
+
+def load_track() -> dict:
+    try:
+        with open(TRACK_FILE, encoding="utf-8") as f:
+            return {r["id"]: r for r in json.load(f)}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        log.warning("load_track failed: %s", e)
+        return {}
+
+
+def _feat(m: dict, sec: Optional["Security"] = None) -> dict:
+    f = {
+        "mcap": m.get("mcap"), "liq": m.get("liq"), "age_min": m.get("age_min"), "chg5": m.get("chg5"),
+        "chg1": m.get("chg1"), "vol_pace": m.get("vol_pace"), "buy5": m.get("buy_ratio5"),
+        "vol1": m.get("vol1"), "dex": m.get("dex"),
+    }
+    try:
+        f["flags"] = market_flags(m)
+    except Exception:
+        f["flags"] = []
+    if sec is not None:
+        f.update({"top10": sec.top10, "dev": sec.dev, "lp": sec.lp_locked, "rug": sec.rug_norm})
+    return f
+
+
+def _new_rec(uid: int, chat_id: int, m: dict, decision: str, kind: str = "-", score=None, grade: str = "",
+             text: str = "", plan: Optional["ScalpPlan"] = None, sec: Optional["Security"] = None) -> dict:
+    ts, price = time.time(), m["price"]
+    rec = {
+        "id": f"{uid}:{m['mint']}:{decision}:{int(ts)}", "uid": uid, "chat": chat_id, "mint": m["mint"],
+        "pair": m.get("pair"), "sym": m.get("symbol") or m["mint"][:5], "ts": ts, "decision": decision,
+        "kind": kind, "score": score, "grade": grade, "text": text, "price0": price,
+        "entry": None, "sl": None, "tp1": None, "tp2": None, "risk_pct": None, "zone_high": None,
+        "f": _feat(m, sec), "last": price, "last_ts": ts, "hi": price, "lo": price, "t_hi": None, "t_lo": None,
+        "first": None, "t_first": None, "hit2": False, "entered0": True, "entered": True, "t_enter": None,
+        "closed": False, "hi_f": None, "lo_f": None,
+    }
+    if plan is not None:
+        rec.update(entry=plan.entry, sl=plan.sl, tp1=plan.tp1, tp2=plan.tp2, risk_pct=plan.risk_pct,
+                   zone_high=plan.zone_high)
+        rec["entered0"] = rec["entered"] = not (plan.kind == "SCALP" and plan.status == "ABOVE_ZONE")
+    return rec
+
+
+def _dup(store: dict, uid: int, mint: str, decision: str, window_sec: float) -> bool:
+    now = time.time()
+    return any(r["uid"] == uid and r["mint"] == mint and r["decision"] == decision and now - r["ts"] < window_sec
+               for r in store.values())
+
+
+def record_scan(bd: dict, uid: int, chat_id: int, res: "ScanResult") -> int:
+    """يسجّل كل ما حلّله /best: الرئيسية والبدائل والمرفوضة والمراقَبة، لقياس نتائجها لاحقاً."""
+    store = bd.setdefault("track", {})
+    seen: dict = {}
+    for c in res.ranked:
+        seen.setdefault(c.m["mint"], c)
+    n = 0
+    for i, c in enumerate(seen.values()):
+        decision = "main" if i == 0 else ("alt" if i <= 2 else "other")
+        if _dup(store, uid, c.m["mint"], decision, 3 * 3600):
+            continue
+        rec = _new_rec(uid, chat_id, c.m, decision, c.plan.kind, c.score, grade_of(c),
+                       "، ".join(market_flags(c.m)), c.plan, c.sec)
+        store[rec["id"]] = rec
+        n += 1
+    for mint, v in res.verdicts.items():
+        m = v.get("m")
+        if mint in seen or not m or (m.get("price") or 0) <= 0:
+            continue
+        decision = "watch" if v["icon"] == "👁" else "rej"
+        if _dup(store, uid, mint, decision, 3 * 3600):
+            continue
+        rec = _new_rec(uid, chat_id, {**m, "mint": mint}, decision, "-", None, "", f"{v['icon']} {v['text']}",
+                       None, res.secs.get(mint))
+        store[rec["id"]] = rec
+        n += 1
+    if n:
+        save_track(bd)
+    return n
+
+
+def record_bounce(bd: dict, it: dict, m: dict, s: dict) -> None:
+    store = bd.setdefault("track", {})
+    if _dup(store, it["uid"], it["mint"], "bounce", 1800):
+        return
+    rec = _new_rec(it["uid"], it["chat"], m, "bounce", "BOUNCE", None, "★" * s["stars"],
+                   f"ارتداد +{s['bounce']:.0f}% من القاع بعد تصحيح {s['retr']:.0%}")
+    rec.update(entry=s["entry"], sl=s["sl"], tp1=s["tp1"], tp2=s["tp2"], risk_pct=s["risk_pct"])
+    rec["f"]["sec_txt"] = it.get("sec_txt", "")
+    store[rec["id"]] = rec
+    save_track(bd)
+
+
+def track_update(r: dict, price: float, now: float) -> None:
+    r["last"], r["last_ts"] = price, now
+    if price > r["hi"]:
+        r["hi"], r["t_hi"] = price, now
+    if price < r["lo"]:
+        r["lo"], r["t_lo"] = price, now
+    if r["sl"] is None:
+        return
+    if not r["entered"]:
+        if r["zone_high"] and price <= r["zone_high"]:
+            r["entered"], r["t_enter"] = True, now
+            r["hi"] = r["lo"] = price
+        return
+    if r["first"] is None:
+        if price <= r["sl"]:
+            r["first"], r["t_first"] = "SL", now
+        elif price >= r["tp1"]:
+            r["first"], r["t_first"] = "TP1", now
+        if r["first"]:
+            r["hi_f"], r["lo_f"] = r["hi"], r["lo"]            # أقصى/أدنى سعر حتى لحظة الحسم فقط
+    if r["first"] == "TP1" and price >= r["tp2"]:
+        r["hit2"] = True
+
+
+async def tracker_cycle(app: Application) -> None:
+    bd = app.bot_data
+    store: dict = bd.get("track") or {}
+    if not store:
+        return
+    now = time.time()
+    for k, r in list(store.items()):
+        if now - r["ts"] > TRACK_KEEP_HOURS * 3600:
+            store.pop(k, None)
+        elif not r["closed"] and now - r["ts"] > TRACK_WINDOW_HOURS * 3600:
+            r["closed"] = True
+    active = [r for r in store.values() if not r["closed"]]
+    if not active:
+        return
+    sink: dict = {}
+    try:
+        await asyncio.wait_for(fetch_pairs(bd["http"], list({r["mint"] for r in active}), (), sink), timeout=40)
+    except asyncio.TimeoutError:
+        pass
+    metrics = {}
+    for p in sink.values():
+        mm = extract_metrics(p)
+        if mm:
+            metrics[mm["mint"]] = mm
+    for r in active:
+        mm = metrics.get(r["mint"])
+        if mm and mm["price"] > 0:
+            r["pair"] = mm["pair"]
+            track_update(r, mm["price"], now)
+    save_track(bd)
+
+
+REPORT_ENTRY_DELAY_SEC = _env_float("REPORT_ENTRY_DELAY_SEC", 60)   # زمن واقعي بين وصول التنبيه وتنفيذك
+PATH_MINUTES = 240
+
+
+def _settle_poll(r: dict) -> dict:
+    p0 = r["price0"] or 1e-18
+    if r["sl"] is None:
+        return {"src": "poll", "max": r["hi"] / p0 - 1, "min": r["lo"] / p0 - 1, "end": r["last"] / p0 - 1}
+    e = r["entry"] or p0
+    if not r["entered"]:
+        return {"src": "poll", "entered": False, "max": r["hi"] / p0 - 1, "end": r["last"] / p0 - 1}
+    hi = r.get("hi_f") or r["hi"]
+    lo = r.get("lo_f") or r["lo"]
+    return {"src": "poll", "entered": True, "first": r["first"], "hit2": r["hit2"], "amb": False,
+            "mfe": hi / e - 1, "mae": lo / e - 1, "max_after": r["hi"] / e - 1,
+            "mins": ((r["t_first"] - r["ts"]) / 60) if r["t_first"] else None, "end": r["last"] / e - 1}
+
+
+def _r5(v: float) -> float:
+    return float(f"{v:.5g}")
+
+
+def _walk(r: dict, cs: list, entry: float, sl: float, tp1: float, tp2: float) -> dict:
+    first, t_first, amb, hit2 = None, None, False, False
+    hi_b = lo_b = hi_a = entry
+    for c in cs:
+        h, lo = c[2], c[3]
+        hi_a = max(hi_a, h)
+        if first is None:
+            hi_b, lo_b = max(hi_b, h), min(lo_b, lo)
+            sl_hit, tp_hit = lo <= sl, h >= tp1
+            if sl_hit:
+                first, amb = "SL", tp_hit
+            elif tp_hit:
+                first = "TP1"
+            if first:
+                t_first = c[0]
+        if first == "TP1" and h >= tp2:
+            hit2 = True
+    return {"src": "candles", "entered": True, "first": first, "hit2": hit2, "amb": amb,
+            "mfe": hi_b / entry - 1, "mae": lo_b / entry - 1, "max_after": hi_a / entry - 1,
+            "mins": ((t_first - r["ts"]) / 60) if t_first else None, "end": cs[-1][4] / entry - 1,
+            "entry_eff": entry}
+
+
+def _settle_candles(r: dict, candles: list, delay: Optional[float] = None) -> Optional[dict]:
+    """يحسم من شموع 1د. الدخول بعد REPORT_ENTRY_DELAY_SEC من التنبيه (واقعي)، والوقف/الهدف بنفس نسبهما.
+    ضرب الوقف والهدف في الدقيقة نفسها يُحسب خسارة (تحفظاً)."""
+    delay = REPORT_ENTRY_DELAY_SEC if delay is None else delay
+    after = [c for c in candles if c[0] >= r["ts"]]
+    cs = [c for c in after if c[0] >= r["ts"] + delay]
+    if len(cs) < 2:
+        return None
+    p0 = r["price0"] or 1e-18
+    hi_all = max(c[2] for c in after)
+    if r["sl"] is None:
+        return {"src": "candles", "max": hi_all / p0 - 1, "min": min(c[3] for c in after) / p0 - 1,
+                "end": after[-1][4] / p0 - 1}
+    plan_e = r["entry"] or p0
+    sl_pct, tp1_pct, tp2_pct = 1 - r["sl"] / plan_e, r["tp1"] / plan_e - 1, r["tp2"] / plan_e - 1
+    if r["entered0"]:
+        entry = cs[0][1]
+        res = _walk(r, cs, entry, entry * (1 - sl_pct), entry * (1 + tp1_pct), entry * (1 + tp2_pct))
+    else:
+        start = next((i for i, c in enumerate(cs) if r["zone_high"] and c[3] <= r["zone_high"]), None)
+        if start is None:
+            return {"src": "candles", "entered": False, "max": hi_all / p0 - 1, "end": after[-1][4] / p0 - 1}
+        res = _walk(r, cs[start:], plan_e, r["sl"], r["tp1"], r["tp2"])
+    res["path"] = [[int(c[0] - r["ts"]), _r5(c[1]), _r5(c[2]), _r5(c[3]), _r5(c[4])]
+                   for c in after if c[0] - r["ts"] <= PATH_MINUTES * 60]
+    return res
+
+
+async def settle_all(client: httpx.AsyncClient, recs: list, status=None) -> list:
+    """يجلب شموع كل عملة (pool) مرة واحدة بفاصل يحترم حدّ GeckoTerminal (30/د)، ويحسم صفقات الخطة بها."""
+    now = time.time()
+    pools = list({r["pair"] for r in recs if r["sl"] is not None and r.get("pair") and now - r["ts"] < 16 * 3600})
+    cache: dict = {}
+    for i, pool in enumerate(pools, 1):
+        try:
+            cache[pool] = await fetch_candles(client, pool, 1, 1000)
+        except Exception:
+            log.exception("settle candles failed")
+            cache[pool] = []
+        if status is not None:
+            try:
+                await status.edit_text(f"📊 جارٍ جلب شموع الدقيقة ({i}/{len(pools)})...")
+            except Exception:
+                pass
+        await asyncio.sleep(2.3)
+    out = []
+    for r in recs:
+        res = None
+        cs = cache.get(r.get("pair"))
+        if r["sl"] is not None and cs:
+            res = _settle_candles(r, cs)
+        out.append((r, res or _settle_poll(r)))
+    return out
+
+
+def _simulate(r: dict, path: list, delay: float, sl_mult: float, tp_mult: float) -> Optional[float]:
+    """يعيد R لصفقة بافتراضات مختلفة (تأخير دخول/اتساع الوقف/قرب الهدف) من المسار المحفوظ."""
+    cs = [c for c in path if c[0] >= delay]
+    if len(cs) < 2 or not r.get("entry"):
+        return None
+    entry = cs[0][1]
+    if entry <= 0:
+        return None
+    tp_pct = r["tp1"] / r["entry"] - 1
+    sl_pct = (1 - r["sl"] / r["entry"]) * sl_mult
+    sl, tp = entry * (1 - sl_pct), entry * (1 + tp_pct * tp_mult)
+    risk = entry - sl
+    for c in cs:
+        if c[3] <= sl:
+            return -1.0
+        if c[2] >= tp:
+            return (tp - entry) / risk
+    return (cs[-1][4] - entry) / risk
+
+
+def whatif_text(settled: list) -> Optional[str]:
+    items = [(r, x["path"]) for r, x in settled if r["sl"] is not None and x.get("path")]
+    if len(items) < 5:
+        return None
+    coins = len({r["mint"] for r, _ in items})
+    lines = [f"🧪 <b>ماذا لو؟ (محاكاة على {len(items)} صفقة من {coins} عملة)</b>", "",
+             "متوسط R لكل صفقة (دخول بعد دقيقة) — الصفوف: اتساع الوقف، الأعمدة: بُعد الهدف:", "",
+             "<code>وقف\\هدف   ×0.5    ×1    ×1.5</code>"]
+    for slm in (1.0, 1.5, 2.0):
+        cells = []
+        for tpm in (0.5, 1.0, 1.5):
+            vals = [v for v in (_simulate(r, p, 60, slm, tpm) for r, p in items) if v is not None]
+            if vals:
+                w = sum(1 for v in vals if v > 0) / len(vals)
+                cells.append(f"{sum(vals) / len(vals):+.2f}({w:.0%})")
+            else:
+                cells.append("—")
+        lines.append(f"<code>×{slm:<4} " + " ".join(f"{c:>9}" for c in cells) + "</code>")
+    lines += ["", "أثر تأخير الدخول (وقف ×1، هدف ×1):"]
+    for dl in (0, 60, 180, 300):
+        vals = [v for v in (_simulate(r, p, dl, 1.0, 1.0) for r, p in items) if v is not None]
+        if vals:
+            lines.append(f"• بعد {dl // 60} د: {sum(vals) / len(vals):+.2f}R ({sum(1 for v in vals if v > 0) / len(vals):.0%} رابحة)")
+    lines.append("\n⚠️ العملات المتكررة تُضخّم العينة؛ اعتبرها مؤشراً لا دليلاً.")
+    return "\n".join(lines)
+
+
+def _fail_reasons(r: dict, x: dict) -> list:
+    f = r.get("f") or {}
+    out = []
+    if (f.get("chg1") or 0) >= 60:
+        out.append(("chase", f"مطاردة: دخلت بعد صعود 1h {f['chg1']:+.0f}%"))
+    if f.get("vol_pace") is not None and f["vol_pace"] < 0.8:
+        out.append(("pace", f"فوليوم يتباطأ ×{f['vol_pace']:.1f}"))
+    if f.get("buy5") is not None and f["buy5"] < 0.5:
+        out.append(("sell", f"ضغط بيع (شراء {f['buy5'] * 100:.0f}%)"))
+    if (f.get("liq") or 1e12) < 15000:
+        out.append(("liq", f"سيولة ضعيفة {fmt_usd(f['liq'])}"))
+    if f.get("age_min") is not None and f["age_min"] < 45:
+        out.append(("young", f"حديثة جداً ({f['age_min']:.0f}د)"))
+    if (f.get("top10") or 0) >= 35:
+        out.append(("top10", f"تركّز Top10 {f['top10']:.0f}%"))
+    mins = x.get("mins")
+    if mins is not None and mins <= 8:
+        out.append(("fast", f"سقطت بسرعة ({mins:.0f}د)"))
+    if r.get("risk_pct") and r["risk_pct"] < 8 and mins is not None and mins <= 15:
+        out.append(("tight", f"وقف ضيق (−{r['risk_pct']:.0f}%) مقابل تذبذب العملة"))
+    mfe = x.get("mfe") or 0
+    tp_dist = (r["tp1"] / r["entry"] - 1) if r.get("tp1") and r.get("entry") else 0
+    if mfe < 0.03:
+        out.append(("flat", "لم تتحرك للأعلى قبل الوقف"))
+    elif tp_dist > 0 and mfe / tp_dist >= 0.6:
+        out.append(("almost", f"وصلت {mfe / tp_dist:.0%} من الهدف الأول ثم انعكست"))
+    if x.get("amb"):
+        out.append(("amb", "ضُرب الوقف والهدف في الدقيقة نفسها (حُسبت خسارة)"))
+    return out or [("unknown", "لا مؤشر واضح — راجع الرسم يدوياً")]
+
+
+def _outcome(r: dict, x: dict) -> str:
+    if x.get("entered") is False:
+        return "noentry"
+    if x.get("first") == "TP1":
+        return "win"
+    if x.get("first") == "SL":
+        return "loss"
+    return "open"
+
+
+def _reason_key(text: str) -> str:
+    return " ".join(re.sub(r"[\d.$%+\-—()\[\]•/:،]+|[KM]\b", " ", text).split()[:4])
+
+
+def _mean(vals: list) -> Optional[float]:
+    vals = [v for v in vals if v is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
+def build_report(settled: list, hours: float):
+    """يرجع (قائمة رسائل HTML، بيانات JSON bytes)."""
+    trades = [(r, x) for r, x in settled if r["sl"] is not None]
+    others = [(r, x) for r, x in settled if r["sl"] is None]
+    cls = [(r, x, _outcome(r, x)) for r, x in trades]
+    wins = [t for t in cls if t[2] == "win"]
+    losses = [t for t in cls if t[2] == "loss"]
+    opens = [t for t in cls if t[2] == "open"]
+    noent = [t for t in cls if t[2] == "noentry"]
+    resolved = len(wins) + len(losses)
+
+    def row(items: list) -> str:
+        w = sum(1 for t in items if t[2] == "win")
+        l = sum(1 for t in items if t[2] == "loss")
+        o = len(items) - w - l
+        return f"✅{w} ❌{l} ⏳{o}" + (f" ({w / (w + l):.0%})" if w + l else "")
+
+    msgs = []
+    head = [f"📊 <b>تقرير آخر {hours:.0f} ساعة</b>", ""]
+    if not trades:
+        head.append("لا توجد صفقات بخطة دخول/هدف/وقف في هذه الفترة.")
+    else:
+        head += [
+            f"الصفقات التي أعطاها البوت: <b>{len(trades)}</b>",
+            f"✅ نجحت (TP1 قبل الوقف): <b>{len(wins)}</b> • ❌ فشلت (وقف): <b>{len(losses)}</b> • "
+            f"⏳ مفتوحة: {len(opens)} • لم تدخل المنطقة: {len(noent)}",
+        ]
+        if resolved:
+            head.append(f"🎯 <b>نسبة النجاح من المحسومة: {len(wins) / resolved:.0%}</b> ({len(wins)}/{resolved})")
+        t2 = sum(1 for t in wins if t[1].get("hit2"))
+        if wins:
+            head.append(f"TP2 تحقق أيضاً في {t2} من {len(wins)} ناجحة")
+        mfe = _mean([t[1].get("mfe") for t in cls if t[2] != "noentry"])
+        mae = _mean([t[1].get("mae") for t in cls if t[2] != "noentry"])
+        if mfe is not None and mae is not None:
+            head.append(f"متوسط أقصى ربح قبل الحسم {mfe * 100:+.0f}% • متوسط أقصى هبوط {mae * 100:+.0f}%")
+        mains = [t for t in cls if t[0]["decision"] == "main"]
+        if mains:
+            head.append(f"الرئيسية فقط: {row(mains)}")
+        coins = Counter(t[0]["sym"] for t in cls)
+        head.append(f"⚠️ العينة الحقيقية: <b>{len(coins)}</b> عملة فقط ({len(cls)} تنبيهاً) — "
+                    + "، ".join(f"{html.escape(s)}×{n}" for s, n in coins.most_common(4) if n > 1))
+        rs = []
+        for r, x, c in cls:
+            if c in ("win", "loss"):
+                sl_d = 1 - r["sl"] / r["entry"]
+                rs.append(((r["tp1"] / r["entry"] - 1) / sl_d) if c == "win" else -1.0)
+        if rs:
+            head.append(f"💰 متوسط R للمحسومة: <b>{sum(rs) / len(rs):+.2f}R</b> (الفوز = TP1، الخسارة = −1R)")
+        quick = [t for t in wins if (t[1].get("mins") or 99) < 2]
+        if quick:
+            head.append(f"⚡ {len(quick)} من الناجحة تحققت خلال أقل من دقيقتين — غالباً غير قابلة للتنفيذ عملياً")
+        head += ["", "<b>حسب النوع:</b>"]
+        for k in ("SCALP", "MOMENTUM", "HOLD", "BOUNCE"):
+            sub = [t for t in cls if t[0]["kind"] == k]
+            if sub:
+                head.append(f"• {KIND_LABEL[k]}: {row(sub)}")
+        scored = [t for t in cls if t[0].get("score") is not None]
+        if scored:
+            head += ["", "<b>حسب التقييم:</b>"]
+            for lo_, hi_, lab in ((75, 101, "≥75"), (65, 75, "65–74"), (0, 65, "<65")):
+                sub = [t for t in scored if lo_ <= t[0]["score"] < hi_]
+                if sub:
+                    head.append(f"• {lab}: {row(sub)}")
+        flagged = [t for t in cls if (t[0].get("f") or {}).get("flags")]
+        clean = [t for t in cls if not (t[0].get("f") or {}).get("flags")]
+        head += ["", "<b>حسب التحذيرات:</b>", f"• بلا تحذيرات: {row(clean)}", f"• مع تحذيرات: {row(flagged)}"]
+    msgs.append("\n".join(head))
+
+    if trades:
+        lines = ["📋 <b>تفاصيل الصفقات</b>", ""]
+        for r, x, c in sorted(cls, key=lambda t: t[0]["ts"])[:25]:
+            lab = f"{KIND_LABEL.get(r['kind'], r['kind'])}{' ' + str(r['score']) if r.get('score') is not None else ''}"
+            mfe_t = f"أقصى {x['mfe'] * 100:+.0f}% / هبوط {x['mae'] * 100:+.0f}%" if x.get("mfe") is not None else ""
+            if c == "win":
+                line = f"✅ <b>{html.escape(r['sym'])}</b> {lab} — TP1 بعد {x.get('mins') or 0:.0f}د" + (" • TP2 ✓" if x.get("hit2") else "") + f" | {mfe_t}"
+            elif c == "loss":
+                line = f"❌ <b>{html.escape(r['sym'])}</b> {lab} — وقف بعد {x.get('mins') or 0:.0f}د | {mfe_t}"
+                line += "\n   ↳ " + " • ".join(t for _, t in _fail_reasons(r, x)[:3])
+            elif c == "open":
+                line = f"⏳ <b>{html.escape(r['sym'])}</b> {lab} — لم تُحسم (الآن {x.get('end', 0) * 100:+.0f}%) | {mfe_t}"
+            else:
+                line = f"💤 <b>{html.escape(r['sym'])}</b> {lab} — لم تنزل لمنطقة الدخول (أقصى {x.get('max', 0) * 100:+.0f}%)"
+            lines.append(line)
+        if len(cls) > 25:
+            lines.append(f"… و{len(cls) - 25} أخرى (التفاصيل الكاملة في ملف JSON)")
+        msgs.append("\n".join(lines))
+
+    if losses:
+        cnt: Counter = Counter()
+        for r, x, _ in losses:
+            for k, _t in _fail_reasons(r, x):
+                cnt[k] += 1
+        diag = ["🔍 <b>تشخيص الفاشلة</b>", "", "أكثر الأسباب المحتملة تكراراً:"]
+        for k, n in cnt.most_common(6):
+            diag.append(f"• {KEY_LABEL.get(k, k)}: {n} من {len(losses)}")
+        if wins:
+            diag += ["", "<b>الناجحة مقابل الفاشلة (متوسطات عند الإشارة):</b>"]
+            for name, fn, fmt in (
+                ("التقييم", lambda r: r.get("score"), "{:.0f}"),
+                ("وتيرة الفوليوم", lambda r: r["f"].get("vol_pace"), "×{:.1f}"),
+                ("ضغط الشراء 5د", lambda r: (r["f"].get("buy5") or 0) * 100 if r["f"].get("buy5") is not None else None, "{:.0f}%"),
+                ("صعود 1h", lambda r: r["f"].get("chg1"), "{:+.0f}%"),
+                ("عمر الزوج (د)", lambda r: r["f"].get("age_min"), "{:.0f}"),
+                ("Top10", lambda r: r["f"].get("top10"), "{:.0f}%"),
+            ):
+                a, b = _mean([fn(t[0]) for t in wins]), _mean([fn(t[0]) for t in losses])
+                if a is not None and b is not None:
+                    diag.append(f"• {name}: ناجحة {fmt.format(a)} ← فاشلة {fmt.format(b)}")
+        msgs.append("\n".join(diag))
+
+    if others:
+        big = sorted(((r, x) for r, x in others), key=lambda t: -(t[1].get("max") or 0))
+        missed = [t for t in big if (t[1].get("max") or 0) >= 1.0]
+        mid = [t for t in big if 0.3 <= (t[1].get("max") or 0) < 1.0]
+        fine = [t for t in big if (t[1].get("max") or 0) < 0.3]
+        rl = [f"🕵️ <b>العملات التي لم يوصِ بها ({len(others)})</b>", "",
+              f"• ركضت ≥+100% بعد تقييمها: <b>{len(missed)}</b> • +30–100%: {len(mid)} • أقل من +30% (قرار سليم): {len(fine)}"]
+        if missed:
+            rl += ["", "<b>الفرص التي فاتت (وسبب الرفض):</b>"]
+            for r, x in missed[:8]:
+                rl.append(f"• <b>{html.escape(r['sym'])}</b> {x['max'] * 100:+.0f}% (MC عند التقييم {fmt_usd(r['f'].get('mcap') or 0)}) — {html.escape(r['text'][:70])}")
+            keys = Counter(_reason_key(r["text"]) for r, _ in missed)
+            rl += ["", "<b>أكثر قاعدة فوّتت فرصاً:</b>"] + [f"• {k}: {n}" for k, n in keys.most_common(4)]
+        msgs.append("\n".join(rl))
+
+    wi = whatif_text(settled)
+    if wi:
+        msgs.append(wi)
+    foot = ("ℹ️ النتائج تقريبية: حُسمت من شموع 1د (دخول بعد دقيقة من التنبيه) حيثما توفرت وإلا من لقطات كل 45 ثانية. "
+            "الوقف والهدف في الدقيقة نفسها يُحسبان خسارة. العينة صغيرة — لا تبنِ قراراً على يوم واحد.")
+    msgs.append(foot)
+
+    data = []
+    for r, x in settled:
+        d = {k: v for k, v in r.items() if k not in ("chat",)}
+        d["result"] = x
+        if r["sl"] is not None and _outcome(r, x) == "loss":
+            d["fail_reasons"] = [t for _, t in _fail_reasons(r, x)]
+        data.append(d)
+    return msgs, json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")
+
+
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    bd = context.application.bot_data
+    uid = update.effective_user.id
+    hours = 24.0
+    if context.args:
+        try:
+            hours = max(1.0, min(48.0, float(context.args[0])))
+        except ValueError:
+            pass
+    lock = bd.setdefault("report_lock", asyncio.Lock())
+    if lock.locked():
+        await msg.reply_text("⏳ أُعدّ تقريراً الآن، انتظر قليلاً.")
+        return
+    async with lock:
+        status = await msg.reply_text("📊 جارٍ إعداد التقرير...")
+        cutoff = time.time() - hours * 3600
+        recs = sorted((r for r in (bd.get("track") or {}).values() if r["uid"] == uid and r["ts"] >= cutoff),
+                      key=lambda r: r["ts"])
+        if not recs:
+            await status.edit_text("لا توجد صفقات مسجلة في هذه الفترة. التسجيل يبدأ تلقائياً مع كل /best وكل تنبيه ارتداد.")
+            return
+        try:
+            settled = await settle_all(bd["http"], recs, status)
+            texts, data = build_report(settled, hours)
+        except Exception:
+            log.exception("report failed")
+            await status.edit_text("❌ فشل إعداد التقرير. راجع Logs في Render.")
+            return
+        try:
+            await status.edit_text("✅ التقرير جاهز")
+        except Exception:
+            pass
+        for t in texts:
+            await safe_send(msg, t[:4000])
+        try:
+            await msg.reply_document(
+                document=io.BytesIO(data),
+                filename=f"solalpha_report_{time.strftime('%Y%m%d_%H%M')}.json",
+                caption="📎 التفاصيل الكاملة (أرسل لي هذا الملف لنحلل الخلل ونحسّن البوت).",
+            )
+        except Exception:
+            log.exception("send report file failed")
+
+
+def _manual_store(bd: dict, uid: int) -> dict:
+    store = bd.setdefault("manual", {}).setdefault(uid, {})
+    cutoff = time.time() - MANUAL_TTL_HOURS * 3600
+    for k in [k for k, s in store.items() if s.added < cutoff]:
+        store.pop(k, None)
+    return store
+
+
+async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يلتقط العقود من رسالة نصية أو محوّلة (Forward) ويحفظها لهذا المستخدم."""
+    msg = update.effective_message
+    user = update.effective_user
+    if msg is None or user is None:
+        return
+    parts = [msg.text or msg.caption or ""]
+    for ent in list(msg.entities or []) + list(msg.caption_entities or []):
+        if getattr(ent, "url", None):
+            parts.append(ent.url)                       # رابط مخفي خلف نص
+    rm = getattr(msg, "reply_markup", None)
+    for row in getattr(rm, "inline_keyboard", None) or []:
+        for b in row:
+            if getattr(b, "url", None):
+                parts.append(b.url)                     # أزرار الرسالة المحوّلة
+    mints, hints = extract_addresses("\n".join(parts))
+    if not (mints or hints):
+        await msg.reply_text("لم أجد عنوان عقد Solana في هذه الرسالة. الصق العقد أو حوّل لي رسالة الإشارة، ثم أرسل /best.")
         return
 
-    status_msg = await update.message.reply_text("🔎 جاري التحليل العميق، لحظات من فضلك...")
-    try:
-        report = await analyze_mint(mint)
-    except Exception:  # pylint: disable=broad-except
-        log.exception("Unhandled error analyzing mint %s", mint)
-        report = "❌ صار خطأ غير متوقع أثناء التحليل. حاول مرة أخرى بعد شوية."
+    ts, post_id = None, 0                               # ts يبقى None للصق العادي
+    fo = getattr(msg, "forward_origin", None)
+    if fo is not None:
+        d = getattr(fo, "date", None)
+        ts = d.timestamp() if d else None
+        chat = getattr(fo, "chat", None)
+        if chat is not None and (getattr(chat, "username", "") or "").lower() == SIGNAL_CHANNEL.lower():
+            post_id = getattr(fo, "message_id", 0) or 0
+    elif getattr(msg, "forward_date", None):            # توافق مع إصدارات PTB الأقدم
+        ts = msg.forward_date.timestamp()
+        fc = getattr(msg, "forward_from_chat", None)
+        if fc is not None and (getattr(fc, "username", "") or "").lower() == SIGNAL_CHANNEL.lower():
+            post_id = getattr(msg, "forward_from_message_id", 0) or 0
 
-    try:
-        await status_msg.edit_text(report, parse_mode=ParseMode.MARKDOWN)
-    except Exception:  # fallback إذا فشل تنسيق Markdown (أحرف خاصة في الاسم مثلاً)
-        await status_msg.edit_text(report)
-
-
-async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "ابعثلي عنوان عقد سولانا صحيح (Mint Address) باش نحلله ليك. اكتب /start للمساعدة."
+    store = _manual_store(context.application.bot_data, user.id)
+    now = time.time()
+    fresh = already = 0
+    for a in mints:
+        prev = store.get(a)
+        if prev is not None and prev.done:           # حُلِّلت سابقاً وهي تحت المراقبة
+            already += 1
+            continue
+        store[a] = Signal(a, post_id, ts, False, True, now)
+        fresh += 1
+    for a in hints:
+        if a not in store:
+            store[a] = Signal(a, post_id, ts, True, True, now)
+            fresh += 1
+    while len(store) > MANUAL_MAX:
+        store.pop(min(store, key=lambda k: store[k].added), None)
+    pending = sum(1 for s in store.values() if not s.done)
+    await msg.reply_text(
+        (f"✅ استلمت {fresh} عقد جديد." if fresh else "ℹ️ لا عقود جديدة في هذه الرسالة.")
+        + (f"\n♻️ {already} عقد محلَّل سابقاً وتحت المراقبة — لن أعيد تحليله." if already else "")
+        + f"\nبانتظار التحليل: {pending}. أرسل /best لتحليل الجديد فقط (و/best all لإعادة تحليل الكل)."
     )
 
 
-# ------------------------------------------------------------------------- #
-#  نقطة الانطلاق
-# ------------------------------------------------------------------------- #
+async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    store = _manual_store(context.application.bot_data, update.effective_user.id)
+    n = len(store)
+    store.clear()
+    await update.effective_message.reply_text(f"🧹 مُسح {n} عقد.")
+
+
+async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    bd = context.application.bot_data
+
+    wait = _cooldown_wait(bd, update.effective_user.id)
+    if wait:
+        await msg.reply_text(f"⏱️ انتظر {wait} ثانية قبل فحص جديد.")
+        return
+
+    status_msg = await msg.reply_text("🔎 بدأ المسح...")
+
+    async def progress(text: str) -> None:
+        await status_msg.edit_text(text)
+
+    res = None
+    try:
+        uid = update.effective_user.id
+        force_all = bool(context.args) and context.args[0].lower() in ("all", "الكل")
+        mstore = _manual_store(bd, uid)
+        extras = [s for s in mstore.values() if force_all or not s.done]   # الجديد فقط
+        had_done = any(s.done for s in mstore.values())
+        cached = bd.get("last_scan") if not extras else None
+        if cached and time.time() - cached.finished_at < SCAN_CACHE_SEC:
+            res = cached
+        else:
+            async with bd["scan_lock"]:
+                res = await asyncio.wait_for(
+                    run_scan(bd["http"], progress, SCAN_BUDGET_SEC, extras), timeout=SCAN_BUDGET_SEC + 30
+                )
+                bd["last_scan"] = res if (res.discovered > 0 and not extras) else None
+
+        if res.discovered > 0:
+            for s in extras:
+                s.done = True
+        if res.signals == 0 and had_done and not extras:
+            text = (
+                "ℹ️ لا توجد عقود جديدة منذ آخر تحليل.\n"
+                "العقود السابقة ما زالت تحت المراقبة (/watchlist) ولن أعيد تحليلها.\n"
+                "الصق عقوداً جديدة ثم /best، أو أرسل /best all لإعادة تحليل الكل."
+            )
+        elif res.signals == 0:
+            text = format_no_signals(res)
+        elif res.discovered == 0:
+            text = (
+                f"⚠️ وجدتُ {res.signals} عقداً لكن لم أحصل على بيانات سوق لأي منها.\n\n"
+                f"حالة المصادر:\n{api_status_text()}\n\n"
+                "• HTTP 403/429 أو timeout ⇒ المشكلة في اتصال سيرفر Render بالمصدر (جرّب بعد دقيقة).\n"
+                "• HTTP 200 ⇒ العقود غير مدرجة بعد (جديدة جداً أو ما زالت قبل الإدراج).\n"
+                "شغّل /diag لاختبار المصادر مباشرة."
+            )
+        elif res.ranked:
+            best = res.ranked[0]
+            alts, seen = [], {best.m["mint"]}
+            for c in res.ranked[1:]:
+                if c.m["mint"] in seen:
+                    continue
+                seen.add(c.m["mint"])
+                alts.append(c)
+                if len(alts) == 2:
+                    break
+            text = format_best(best, alts)
+        else:
+            text = format_no_result(res)
+    except asyncio.TimeoutError:
+        text = "⌛ انتهت مهلة المسح (المصادر بطيئة). حاول مجدداً بعد قليل."
+    except Exception:
+        log.exception("Scan failed")
+        text = "❌ حدث خطأ أثناء المسح. حاول مجدداً بعد قليل."
+
+    await safe_edit(status_msg, msg, text)
+    if res is not None and (res.verdicts or res.unresolved):
+        await safe_send(msg, format_verdicts(res))
+    if res is not None and res.watch:
+        added = add_watch(bd, update.effective_user.id, update.effective_chat.id, res.watch)
+        if added:
+            await safe_send(msg, format_watch_added(added))
+    if res is not None and res.signals and res.discovered:
+        try:
+            record_scan(bd, update.effective_user.id, update.effective_chat.id, res)
+        except Exception:
+            log.exception("record_scan failed")
+
+
+async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    bd = context.application.bot_data
+
+    wait = _cooldown_wait(bd, update.effective_user.id)
+    if wait:
+        await msg.reply_text(f"⏱️ انتظر {wait} ثانية.")
+        return
+
+    status_msg = await msg.reply_text("🧪 جارٍ تشخيص قراءة القناة ...")
+    try:
+        async with bd["scan_lock"]:
+            client = bd["http"]
+            signals, info = await asyncio.wait_for(discover_signals(client), timeout=60)
+            addrs = [s.mint for s in signals]
+            hints = [s.mint for s in signals if s.is_hint]
+            sink: dict = {}
+            if addrs:
+                try:
+                    await asyncio.wait_for(fetch_pairs(client, addrs, hints, sink), timeout=40)
+                except asyncio.TimeoutError:
+                    pass
+            pairs = list(sink.values())
+            probes = await probe_apis(client)
+        stats: Counter = Counter()
+        passed = 0
+        for p in pairs:
+            m = extract_metrics(p)
+            if m is None:
+                stats["بيانات ناقصة"] += 1
+                continue
+            reason = pre_filter(m)
+            if reason:
+                stats[reason] += 1
+            else:
+                passed += 1
+
+        manual_n = len(_manual_store(bd, update.effective_user.id))
+        age = info.get("newest_age_min")
+        lines = [f"🧪 <b>تشخيص قراءة القناة</b> (@{html.escape(SIGNAL_CHANNEL)})", ""]
+        lines.append(f"• Telethon: {'✅ متصل (جلسة مستخدم)' if TL.get('client') else '❌ غير متصل'}")
+        lines.append(f"• قراءة القناة: {'✅ نجحت عبر ' + str(info['source']) if info['ok'] else '❌ فشلت'}")
+        shown = info["errors"] if not info["ok"] else [e for e in info["errors"] if not e.startswith("Telethon") or info["source"] != "Telethon"]
+        for er in shown[:4]:
+            lines.append(f"   ↳ {html.escape(str(er))}")
+        lines += [
+            f"• رسائل مقروءة: {info['messages']} ",
+            f"• رسائل فيها عقود: {info['with_addr']}",
+            f"• أحدث رسالة: {fmt_age(age) if age is not None else 'غير معروف'}",
+            f"• عقود أرسلتها يدوياً (منتظرة): {manual_n}",
+            "",
+            f"🔢 عقود فريدة مستخرجة: {len(addrs)} | أزواج DexScreener: {len(pairs)}",
+            f"✅ اجتازت الفلتر الأولي: {passed}",
+        ]
+        missing = len(addrs) - len(pairs)
+        if missing > 0 and pairs:
+            lines.append(f"• بلا زوج على DexScreener: ~{missing}")
+        lines += ["", "🌐 <b>اختبار المصادر من السيرفر:</b>"] + [f"• {n}: {r}" for n, r in probes]
+        if stats:
+            lines += ["", "📋 <b>أسباب الاستبعاد:</b>"]
+            for reason, n in stats.most_common(12):
+                lines.append(f"• {html.escape(reason)}: {n}")
+        text = "\n".join(lines)
+    except Exception:
+        log.exception("Diag failed")
+        text = "❌ فشل التشخيص. راجع Logs في Render."
+
+    await safe_edit(status_msg, msg, text)
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.error("Unhandled exception", exc_info=context.error)
+
+
+# ───────────────────────────── Health server + Keep-alive + التشغيل ─────────────────────────────
+
+
+async def handle_health_check(request: web.Request) -> web.Response:
+    return web.Response(text="OK", status=200)
+
+
+async def start_web_server() -> web.AppRunner:
+    app = web.Application()
+    app.router.add_get("/", handle_health_check)
+    app.router.add_get("/health", handle_health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "8080"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info("Health check server running on port %s", port)
+    return runner
+
+
+async def keepalive_loop(client: httpx.AsyncClient) -> None:
+    """يمنع نوم خدمة Render المجانية: طلب HTTP دوري على الرابط العام للخدمة."""
+    url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SELF_URL")
+    if not url:
+        log.info("Keep-alive disabled (no RENDER_EXTERNAL_URL / SELF_URL)")
+        return
+    target = url.rstrip("/") + "/health"
+    log.info("Keep-alive pinging %s every %ss", target, KEEPALIVE_SEC)
+    while True:
+        await asyncio.sleep(KEEPALIVE_SEC)
+        try:
+            await client.get(target)
+        except Exception as e:
+            log.warning("Keep-alive failed: %s", e)
+
+
+async def run_all() -> None:
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("best", best_cmd))
+    app.add_handler(CommandHandler("diag", diag_cmd))
+    app.add_handler(CommandHandler("clear", clear_cmd))
+    app.add_handler(CommandHandler("watchlist", watchlist_cmd))
+    app.add_handler(CommandHandler("unwatch", unwatch_cmd))
+    app.add_handler(CommandHandler("report", report_cmd))
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & ~filters.COMMAND & (filters.TEXT | filters.CAPTION), on_user_message
+    ))
+    app.add_error_handler(on_error)
+
+    runner = await start_web_server()
+    await app.initialize()
+    await post_init(app)
+    await app.start()
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    keepalive = asyncio.create_task(keepalive_loop(app.bot_data["http"]))
+    watcher = asyncio.create_task(watch_loop(app))
+    log.info("SolAlpha Sniper v4.0 is running — signal channel: @%s", SIGNAL_CHANNEL)
+
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+    try:
+        await stop.wait()
+    finally:
+        log.info("Shutting down...")
+        keepalive.cancel()
+        watcher.cancel()
+        try:
+            await app.updater.stop()
+            await app.stop()
+            await post_shutdown(app)
+            await app.shutdown()
+        finally:
+            await runner.cleanup()
+
 
 def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
-        raise SystemExit("خطأ: متغيّر البيئة TELEGRAM_BOT_TOKEN غير موجود.")
-
-    # خادم Health Check في Thread منفصل حتى يبقى البوت "حي" في نظر Render
-    threading.Thread(target=run_health_server, args=(PORT,), daemon=True).start()
-
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(MessageHandler(filters.Regex(SOLANA_MINT_RE), handle_mint))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown))
-
-    log.info("Bot started. Polling for updates...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+        raise SystemExit("TELEGRAM_BOT_TOKEN غير مضبوط في متغيرات البيئة.")
+    asyncio.run(run_all())
 
 
 if __name__ == "__main__":
