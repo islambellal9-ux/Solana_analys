@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SolAlpha Sniper v4.0 — Telegram bot (Render Web Service)
+SolAlpha Sniper v4.1 — Telegram bot (Render Web Service)
 مصدر العملات: قناة الإشارات https://t.me/solhousesignal حصرياً.
 طريقة القراءة (بالترتيب): 0) الوضع اليدوي: ترسل للبوت عقوداً أو تحوّل (Forward) رسائل الإشارات فيحللها /best (لا يحتاج أي إعداد)
                           1) Telethon بجلسة مستخدم (TELETHON_SESSION) — الأوثق
@@ -1580,6 +1580,8 @@ WELCOME = (
 )
 
 HELP = (
+    "📍 <b>الارتداد</b>: لا أنبّهك إلا عند ارتداد مؤكد من دعم قوي (قيعان سابقة + فوليوم)، وأنبّهك عند اقتراب السعر من الدعم لتنتظر التأكيد. "
+    "الارتدادات الضعيفة تُسجَّل ظلّياً للمقارنة ولا تُرسل (BOUNCE_REQUIRE_SUPPORT=0 لإرسالها).\n\n"
     "👁 <b>المراقبة</b>: كل عملة آمنة (وكذلك الحديثة جداً، التي على Bonding Curve، الهابطة، أو التي صعدت كثيراً) تدخل قائمة المراقبة، "
     "وأنبّهك عند ارتداد مؤكد بعد تصحيح، أو عند نضجها/هجرتها واجتيازها الفحص الأمني.\n\n"
     "📥 <b>الوضع اليدوي</b>: الصق عنوان عقد أو حوّل (Forward) رسالة إشارة إلى البوت، ثم أرسل /best. "
@@ -1601,7 +1603,7 @@ HELP = (
 async def post_init(application: Application) -> None:
     application.bot_data["http"] = httpx.AsyncClient(
         timeout=httpx.Timeout(12.0),
-        headers={"User-Agent": "SolAlphaSniper/4.0", "Accept": "application/json"},
+        headers={"User-Agent": "SolAlphaSniper/4.1", "Accept": "application/json"},
         follow_redirects=True,
     )
     application.bot_data["scan_lock"] = asyncio.Lock()
@@ -1779,8 +1781,87 @@ def format_watch_added(added: list) -> str:
     return "\n".join(lines)
 
 
-def detect_bounce(candles: list, m: dict):
-    """يكشف ارتداداً مؤكداً بعد موجة صاعدة وتصحيح. يرجع (setup|None، سبب_عدم_الإشارة)."""
+# ───────────────────────────── دعم قوي + ارتداد مؤكد منه + حالة السوق ─────────────────────────────
+SUPPORT_MIN_STRENGTH = _env_float("SUPPORT_MIN_STRENGTH", 3)      # قوة الدعم المطلوبة للتنبيه
+SUPPORT_TOL_PCT = _env_float("SUPPORT_TOL_PCT", 3)                # تسامح قاع الارتداد مع حدود الدعم
+SUPPORT_NEAR_PCT = _env_float("SUPPORT_NEAR_PCT", 6)              # تنبيه الاقتراب من الدعم
+SUPPORT_REFRESH_SEC = _env_float("SUPPORT_REFRESH_SEC", 300)
+WATCH_SUP_PER_CYCLE = int(_env_float("WATCH_SUP_PER_CYCLE", 4))
+BOUNCE_REQUIRE_SUPPORT = os.getenv("BOUNCE_REQUIRE_SUPPORT", "1") != "0"   # 0 = أرسل الضعيف أيضاً
+REGIME_MIN_RESOLVED = 6
+REGIME_LABEL = {"good": "🟢 جيد", "neutral": "🟡 محايد", "bleeding": "🔴 نازف (الدعم يُكسر)"}
+
+
+def find_supports(candles: list, k: int = 3, min_sep: int = 6) -> list:
+    """مناطق دعم أفقية من قيعان محورية (pivot lows) مجمّعة بنسبة 3%.
+    القوة = لمسات متباعدة (حتى 4) + فوليوم عند اللمس + أدنى قاع في النافذة + قاعدة الإطلاق."""
+    cs = candles[:-1]
+    if len(cs) < 40:
+        return []
+    vols = sorted(c[5] for c in cs)
+    med = vols[len(vols) // 2] or 1e-12
+    gmin = min(c[3] for c in cs)
+    piv = []
+    for i in range(k, len(cs) - k):
+        lo = cs[i][3]
+        if lo > 0 and lo <= min(c[3] for c in cs[i - k:i + k + 1]):
+            piv.append((i, lo, cs[i][5]))
+    piv.sort(key=lambda t: t[1])
+    clusters: list = []
+    for p in piv:
+        if clusters and p[1] <= clusters[-1][0][1] * 1.03:
+            clusters[-1].append(p)
+        else:
+            clusters.append([p])
+    young = len(cs) < 280                                   # النافذة تبدأ من إطلاق العملة تقريباً
+    zones = []
+    for cl in clusters:
+        idx = sorted(p[0] for p in cl)
+        distinct = 1 + sum(1 for a, b in zip(idx, idx[1:]) if b - a >= min_sep)
+        lows = [p[1] for p in cl]
+        level = sum(lows) / len(lows)
+        vol_x = (sum(p[2] for p in cl) / len(cl)) / med
+        gl = level <= gmin * 1.03
+        base = young and idx[0] <= 8
+        strength = min(distinct, 4) + int(vol_x >= 1.5) + int(gl) + int(base)
+        zones.append({
+            "level": level, "low": min(min(lows), level * 0.985), "high": max(max(lows), level * 1.015),
+            "touches": distinct, "strength": strength, "vol_x": round(vol_x, 1), "gl": gl, "base": base,
+        })
+    return sorted(zones, key=lambda z: -z["strength"])[:8]
+
+
+def _rejection(cs: list) -> bool:
+    """رفض سعري في آخر الشموع: ذيل سفلي طويل مع إغلاق في النصف الأعلى، أو ابتلاع صاعد."""
+    for c in cs[-8:]:
+        rng = c[2] - c[3]
+        if rng > 0 and (min(c[1], c[4]) - c[3]) >= 0.5 * rng and c[4] >= c[3] + 0.5 * rng:
+            return True
+    for a, b in zip(cs[-4:], cs[-3:]):
+        if a[4] < a[1] and b[4] > b[1] and b[4] >= a[1] and b[1] <= a[4]:
+            return True
+    return False
+
+
+def compute_regime(bd: dict) -> dict:
+    """حالة السوق: نسبة نجاح آخر ارتدادات محسومة + اتساع الهبوط في قائمة المراقبة."""
+    recs = sorted((r for r in (bd.get("track") or {}).values()
+                   if r["decision"] == "bounce" and r["first"] in ("TP1", "SL")), key=lambda r: r["ts"])[-8:]
+    wr = (sum(1 for r in recs if r["first"] == "TP1") / len(recs)) if len(recs) >= REGIME_MIN_RESOLVED else None
+    items = [it for it in (bd.get("watch") or {}).values() if it.get("sec_ok") and it.get("chg1") is not None]
+    breadth = (sum(1 for it in items if it["chg1"] <= -15) / len(items)) if len(items) >= 4 else None
+    state = "neutral"
+    if (wr is not None and wr <= 0.25) or (breadth is not None and breadth >= 0.7):
+        state = "bleeding"
+    elif wr is not None and wr >= 0.5 and (breadth is None or breadth < 0.4):
+        state = "good"
+    return {"state": state, "wr": wr, "breadth": breadth}
+
+
+def detect_bounce(candles: list, m: dict, zones: Optional[list] = None, min_strength: Optional[float] = None,
+                  regime_state: str = "neutral"):
+    """ارتداد مؤكد بعد موجة صاعدة وتصحيح، مع ربط القاع بمنطقة دعم قوية. يرجع (setup|None، سبب)."""
+    min_strength = SUPPORT_MIN_STRENGTH if min_strength is None else min_strength
     if len(candles) < 30:
         return None, f"شموع قليلة ({len(candles)})"
     w = candles[:-1][-120:]                       # شموع مغلقة فقط
@@ -1813,7 +1894,14 @@ def detect_bounce(candles: list, m: dict):
         return None, "لا شمعتان خضراوان من آخر ثلاث"
     if m["buy_ratio5"] < 0.5:
         return None, f"ضغط البيع أعلى (شراء {m['buy_ratio5'] * 100:.0f}%)"
-    sl = trough * (1 - BOUNCE_SL_BUFFER)
+
+    tol = SUPPORT_TOL_PCT / 100
+    near = [z for z in (zones or []) if z["low"] * (1 - tol) <= trough <= z["high"] * (1 + tol)]
+    sup = max(near, key=lambda z: z["strength"]) if near else None
+    reject = _rejection(w[-10:])
+    weak = sup is None or sup["strength"] < min_strength
+    base_low = min(trough, sup["low"]) if sup else trough
+    sl = base_low * (1 - BOUNCE_SL_BUFFER)
     risk_pct = (price - sl) / price * 100
     if risk_pct <= 0 or risk_pct > MAX_SL_RISK_PCT:
         return None, f"وقف الخسارة بعيد ({risk_pct:.0f}%)"
@@ -1823,13 +1911,17 @@ def detect_bounce(candles: list, m: dict):
         return None, "الهدف الأول قريب جداً من السعر"
     recent = [c[5] for c in w[-3:]]
     prev = [c[5] for c in w[-13:-3]]
-    vol_up = bool(prev) and sum(prev) > 0 and (sum(recent) / len(recent)) > 1.2 * (sum(prev) / len(prev))
-    stars = 1 + int(vol_up) + int(m["buy_ratio5"] >= 0.6) + int(bounce <= 12)
+    vol_x = (sum(recent) / len(recent)) / (sum(prev) / len(prev)) if prev and sum(prev) > 0 else 0.0
+    vol_up = vol_x > 1.2
+    stars = min(5, 1 + int(vol_up) + int(m["buy_ratio5"] >= 0.6) + int(bounce <= 12) + int(not weak) + int(reject))
+    if weak:
+        stars = min(stars, 3)
     return {
         "key": str(int(w[tr_i][0])), "peak": peak, "trough": trough, "leg_low": leg_low, "retr": retr,
         "bounce": bounce, "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": peak,
         "risk_pct": risk_pct, "rr1": (tp1 - price) / (price - sl), "rr2": (tp2 - price) / (price - sl),
-        "stars": stars, "vol_up": vol_up, "buy": m["buy_ratio5"], "at": time.time(),
+        "stars": stars, "vol_up": vol_up, "vol_x": vol_x, "buy": m["buy_ratio5"], "at": time.time(),
+        "support": sup, "weak": weak, "reject": reject, "regime": regime_state,
     }, None
 
 
@@ -1839,24 +1931,69 @@ def format_bounce_alert(it: dict, m: dict, s: dict) -> str:
     def mc(p: float) -> str:
         return fmt_usd(p * f) if f else "—"
 
-    stars = "★" * s["stars"] + "☆" * (4 - s["stars"])
-    notes = ["قاع أعلى", "شمعتان خضراوان", f"شراء {s['buy'] * 100:.0f}%"] + (["فوليوم الارتداد أعلى"] if s["vol_up"] else [])
+    stars = "★" * s["stars"] + "☆" * (5 - s["stars"])
+    notes = ["قاع أعلى", "شمعتان خضراوان", f"شراء {s['buy'] * 100:.0f}%"]
+    if s.get("reject"):
+        notes.append("رفض سعري (ذيل/ابتلاع)")
+    if s["vol_up"]:
+        notes.append(f"فوليوم الارتداد ×{s['vol_x']:.1f}")
+    sup = s.get("support")
+    if sup and not s.get("weak"):
+        why = [f"{sup['touches']} لمسات"]
+        if sup.get("gl"):
+            why.append("أدنى قاع")
+        if sup.get("base"):
+            why.append("قاعدة الإطلاق")
+        if sup["vol_x"] >= 1.5:
+            why.append(f"فوليوم ×{sup['vol_x']}")
+        sup_line = f"📍 <b>ارتداد من دعم قوي</b> MC {mc(sup['low'])}–{mc(sup['high'])} (قوة {sup['strength']}: {'، '.join(why)})\n"
+    else:
+        sup_line = "⚠️ <b>بلا دعم قوي مؤكد</b> — ارتداد أضعف، قلّل الحجم\n"
+    reg = REGIME_LABEL.get(s.get("regime", "neutral"), "")
     return (
         f"🔔 <b>ارتداد محتمل — {html.escape(it['sym'])}</b>  {stars}\n\n"
         f"📋 <code>{it['mint']}</code>\n\n"
+        f"{sup_line}"
         f"📉 القمة {mc(s['peak'])} ← القاع {mc(s['trough'])} (تصحيح {s['retr']:.0%}) ← الآن {mc(s['entry'])} (+{s['bounce']:.0f}% من القاع)\n"
-        f"✅ {' • '.join(notes)}\n\n"
+        f"✅ {' • '.join(notes)}\n"
+        f"🌡️ السوق: {reg}\n\n"
         f"🟢 دخول: {fmt_price(s['entry'])} | MC {mc(s['entry'])}\n"
         f"🎯 TP1: {fmt_price(s['tp1'])} (+{(s['tp1'] / s['entry'] - 1) * 100:.0f}%) | MC {mc(s['tp1'])}\n"
         f"🎯 TP2: {fmt_price(s['tp2'])} (+{(s['tp2'] / s['entry'] - 1) * 100:.0f}%) | MC {mc(s['tp2'])}\n"
         f"🏁 القمة السابقة: {fmt_price(s['tp3'])} | MC {mc(s['tp3'])}\n"
-        f"🛑 SL: {fmt_price(s['sl'])} (−{s['risk_pct']:.0f}%) | MC {mc(s['sl'])}\n"
+        f"🛑 SL: {fmt_price(s['sl'])} (−{s['risk_pct']:.0f}%) تحت الدعم | MC {mc(s['sl'])}\n"
         f"⚖️ R:R → TP1 {s['rr1']:.1f} / TP2 {s['rr2']:.1f}\n"
         f"🛡️ {html.escape(it.get('sec_txt') or '—')}\n\n"
         f"🔗 <a href=\"https://dexscreener.com/solana/{m['pair']}\">DexScreener</a> • "
         f"<a href=\"https://rugcheck.xyz/tokens/{it['mint']}\">RugCheck</a>\n\n"
         "⚠️ كشف آلي لارتداد بعد تصحيح — لا يضمن استمراره. لا تدخل بأكثر مما تتحمل خسارته."
     )
+
+
+async def maybe_support_alert(app: Application, it: dict, m: dict, min_strength: float) -> None:
+    """تنبيه اقتراب السعر من دعم قوي (لتجهّز وتنتظر ارتداداً مؤكداً بدل مطاردته)."""
+    zones = it.get("zones") or []
+    price = m["price"]
+    if price <= 0 or not zones:
+        return
+    near = [z for z in zones if z["strength"] >= min_strength
+            and z["low"] * (1 - SUPPORT_TOL_PCT / 100) <= price <= z["high"] * (1 + SUPPORT_NEAR_PCT / 100)]
+    if not near:
+        return
+    z = max(near, key=lambda x: x["strength"])
+    key = f"{z['level']:.3g}"
+    now = time.time()
+    alerted = it.setdefault("sup_alerted", {})
+    if now - alerted.get(key, 0) < 5400:
+        return
+    alerted[key] = now
+    f = it.get("factor") or ((m["mcap"] / price) if price > 0 else 0.0)
+    dist = (price / z["high"] - 1) * 100
+    where = "داخل الدعم" if dist <= 0 else f"يبعد {dist:.1f}% فوقه"
+    await notify(app, it, (
+        f"📍 <b>{html.escape(it['sym'])}</b> تقترب من دعم قوي (قوة {z['strength']}، {z['touches']} لمسات)\n"
+        f"الدعم: MC {fmt_usd(z['low'] * f)}–{fmt_usd(z['high'] * f)} • الآن {fmt_usd(m['mcap'])} ({where})\n"
+        "أراقب ارتداداً مؤكداً منه (رفض سعري + حجم + قاع أعلى) وأنبّهك — لا تدخل قبل التأكيد."))
 
 
 async def notify(app: Application, it: dict, text: str) -> None:
@@ -1945,6 +2082,10 @@ async def watch_cycle(app: Application) -> None:
             metrics[mm["mint"]] = mm
 
     sec_budget, candle_budget = WATCH_SEC_PER_CYCLE, WATCH_CANDLES_PER_CYCLE
+    sup_budget = WATCH_SUP_PER_CYCLE
+    regime = compute_regime(bd)
+    bd["regime"] = regime
+    min_strength = SUPPORT_MIN_STRENGTH + (1 if regime["state"] == "bleeding" else 0)
     for it in sorted(store.values(), key=lambda x: x["candle_ts"]):
         if store.get(it["key"]) is not it:
             continue
@@ -1952,6 +2093,7 @@ async def watch_cycle(app: Application) -> None:
         if m is None:
             continue
         it["price"], it["mcap"], it["dex"], it["pair"] = m["price"], m["mcap"], m["dex"], m["pair"]
+        it["chg1"] = m["chg1"]
         if it["mcap0"] > 0 and m["mcap"] < it["mcap0"] * (1 - WATCH_DEAD_PCT / 100) and not it.get("setup"):
             store.pop(it["key"], None)
             await notify(app, it, (f"☠️ <b>{html.escape(it['sym'])}</b> انهارت أكثر من {WATCH_DEAD_PCT:.0f}% منذ الإضافة "
@@ -1968,18 +2110,29 @@ async def watch_cycle(app: Application) -> None:
             await evaluate_pending(app, it, m, store)
             if store.get(it["key"]) is not it or it["sec_ok"] is not True:
                 continue
+        if m["price"] > 0 and sup_budget > 0 and time.time() - it.get("sup_ts", 0) > SUPPORT_REFRESH_SEC:
+            sup_budget -= 1
+            it["sup_ts"] = time.time()
+            it["zones"] = find_supports(await fetch_candles(client, m["pair"], 5, 288), 3, 6)   # دعم 24 ساعة
+            await asyncio.sleep(0.5)
+        await maybe_support_alert(app, it, m, min_strength)
         if it.get("setup") or candle_budget <= 0 or m["price"] <= 0:
             continue
         candle_budget -= 1
         it["candle_ts"] = time.time()
         candles = await fetch_candles(client, m["pair"], 1)
-        setup, why = detect_bounce(candles, m)
+        zones = it.get("zones") or find_supports(candles, 5, 12)     # عملة حديثة: دعم من شموع الدقيقة
+        setup, why = detect_bounce(candles, m, zones, min_strength, regime["state"])
         it["why"] = why or ""
         if setup and setup["key"] not in it["alerted"]:
             it["alerted"] = (it["alerted"] + [setup["key"]])[-10:]
-            it["setup"] = setup
-            await notify(app, it, format_bounce_alert(it, m, setup))
-            record_bounce(bd, it, m, setup)
+            if setup["weak"] and BOUNCE_REQUIRE_SUPPORT:
+                record_bounce(bd, it, m, setup, shadow=True)          # بلا إرسال: للمقارنة في التقرير
+                it["why"] = "ارتداد ضعيف (بلا دعم قوي) — سُجّل ظلّياً ولم يُرسل"
+            else:
+                it["setup"] = setup
+                await notify(app, it, format_bounce_alert(it, m, setup))
+                record_bounce(bd, it, m, setup)
         await asyncio.sleep(0.5)
     save_watch(bd)
 
@@ -2009,7 +2162,8 @@ async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not items:
         await update.effective_message.reply_text("قائمة المراقبة فارغة. شغّل /best بعد إرسال عقود، وكل عملة آمنة (أو قابلة للمراقبة) تُضاف تلقائياً.")
         return
-    lines = [f"👁 <b>قائمة المراقبة ({len(items)})</b>", ""]
+    reg = compute_regime(context.application.bot_data)
+    lines = [f"👁 <b>قائمة المراقبة ({len(items)})</b> • السوق: {REGIME_LABEL[reg['state']]}", ""]
     for it in items[:20]:
         if it.get("setup"):
             st = "🟢 إشارة ارتداد نشطة"
@@ -2021,6 +2175,12 @@ async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         lines.append(f"• <b>{html.escape(it['sym'])}</b> {fmt_usd(it['mcap0'])} ← {fmt_usd(it['mcap'])} ({chg:+.0f}%) — {st}")
         if it.get("why") and not it.get("setup"):
             lines.append(f"   <i>{html.escape(it['why'])}</i>")
+        zs = [z for z in (it.get("zones") or []) if z["strength"] >= SUPPORT_MIN_STRENGTH and it["price"] > 0
+              and z["high"] <= it["price"] * 1.02]
+        if zs and it.get("factor"):
+            z = max(zs, key=lambda x: x["high"])
+            lines.append(f"   📍 أقرب دعم قوي: MC {fmt_usd(z['low'] * it['factor'])}–{fmt_usd(z['high'] * it['factor'])} "
+                         f"(قوة {z['strength']}، يبعد {max(0.0, (1 - z['high'] / it['price']) * 100):.0f}% تحتنا)")
     if len(items) > 20:
         lines.append(f"… و{len(items) - 20} أخرى")
     await safe_send(update.effective_message, "\n".join(lines))
@@ -2050,7 +2210,7 @@ KEY_LABEL = {
     "amb": "وقف وهدف في الدقيقة نفسها", "unknown": "بلا مؤشر واضح",
 }
 KIND_LABEL = {"SCALP": "⚡سكالبيج", "MOMENTUM": "🚀زخم", "HOLD": "🧭احتفاظ", "BOUNCE": "🔔ارتداد", "-": "—"}
-DECISION_LABEL = {"main": "رئيسية", "alt": "بديل", "other": "مرتّبة", "bounce": "ارتداد", "watch": "مراقبة", "rej": "مرفوضة"}
+DECISION_LABEL = {"bounce_weak": "ارتداد ضعيف (ظلّي)", "main": "رئيسية", "alt": "بديل", "other": "مرتّبة", "bounce": "ارتداد", "watch": "مراقبة", "rej": "مرفوضة"}
 
 
 def save_track(bd: dict) -> None:
@@ -2145,14 +2305,19 @@ def record_scan(bd: dict, uid: int, chat_id: int, res: "ScanResult") -> int:
     return n
 
 
-def record_bounce(bd: dict, it: dict, m: dict, s: dict) -> None:
+def record_bounce(bd: dict, it: dict, m: dict, s: dict, shadow: bool = False) -> None:
     store = bd.setdefault("track", {})
-    if _dup(store, it["uid"], it["mint"], "bounce", 1800):
+    decision = "bounce_weak" if shadow else "bounce"
+    if _dup(store, it["uid"], it["mint"], decision, 1800):
         return
-    rec = _new_rec(it["uid"], it["chat"], m, "bounce", "BOUNCE", None, "★" * s["stars"],
-                   f"ارتداد +{s['bounce']:.0f}% من القاع بعد تصحيح {s['retr']:.0%}")
+    sup = s.get("support")
+    rec = _new_rec(it["uid"], it["chat"], m, decision, "BOUNCE", None, "★" * s["stars"],
+                   f"ارتداد +{s['bounce']:.0f}% من القاع بعد تصحيح {s['retr']:.0%}" + (" (ظلّي: بلا دعم قوي)" if shadow else ""))
     rec.update(entry=s["entry"], sl=s["sl"], tp1=s["tp1"], tp2=s["tp2"], risk_pct=s["risk_pct"])
-    rec["f"]["sec_txt"] = it.get("sec_txt", "")
+    rec["f"].update({"sec_txt": it.get("sec_txt", ""), "regime": s.get("regime"), "reject": s.get("reject"),
+                     "vol_x": s.get("vol_x"), "support": (
+                         {k: sup[k] for k in ("level", "low", "high", "touches", "strength", "vol_x", "gl", "base")}
+                         if sup else None)})
     store[rec["id"]] = rec
     save_track(bd)
 
@@ -2334,7 +2499,7 @@ def _simulate(r: dict, path: list, delay: float, sl_mult: float, tp_mult: float)
 
 
 def whatif_text(settled: list) -> Optional[str]:
-    items = [(r, x["path"]) for r, x in settled if r["sl"] is not None and x.get("path")]
+    items = [(r, x["path"]) for r, x in settled if r["sl"] is not None and r["decision"] != "bounce_weak" and x.get("path")]
     if len(items) < 5:
         return None
     coins = len({r["mint"] for r, _ in items})
@@ -2412,7 +2577,7 @@ def _mean(vals: list) -> Optional[float]:
 
 def build_report(settled: list, hours: float):
     """يرجع (قائمة رسائل HTML، بيانات JSON bytes)."""
-    trades = [(r, x) for r, x in settled if r["sl"] is not None]
+    trades = [(r, x) for r, x in settled if r["sl"] is not None and r["decision"] != "bounce_weak"]
     others = [(r, x) for r, x in settled if r["sl"] is None]
     cls = [(r, x, _outcome(r, x)) for r, x in trades]
     wins = [t for t in cls if t[2] == "win"]
@@ -2536,6 +2701,36 @@ def build_report(settled: list, hours: float):
             rl += ["", "<b>أكثر قاعدة فوّتت فرصاً:</b>"] + [f"• {k}: {n}" for k, n in keys.most_common(4)]
         msgs.append("\n".join(rl))
 
+    shadow = [(r, x, _outcome(r, x)) for r, x in settled if r["sl"] is not None and r["decision"] == "bounce_weak"]
+    given_b = [t for t in cls if t[0]["decision"] == "bounce"]
+    if shadow or given_b:
+        def rstat(items: list) -> str:
+            if not items:
+                return "—"
+            w = sum(1 for t in items if t[2] == "win")
+            l = sum(1 for t in items if t[2] == "loss")
+            rr = []
+            for r, x, c in items:
+                if c in ("win", "loss"):
+                    sl_d = 1 - r["sl"] / r["entry"]
+                    rr.append(((r["tp1"] / r["entry"] - 1) / sl_d) if c == "win" else -1.0)
+            return f"✅{w} ❌{l} ⏳{len(items) - w - l}" + (f" • {sum(rr) / len(rr):+.2f}R" if rr else "")
+
+        sec = ["📍 <b>جودة الدعم وحالة السوق</b>", "",
+               f"• ارتداد من دعم قوي (أُرسل لك): {rstat(given_b)}",
+               f"• ارتداد ضعيف بلا دعم (لم يُرسل — ظلّي): {rstat(shadow)}"]
+        for st_, lab in (("good", "🟢 سوق جيد"), ("neutral", "🟡 محايد"), ("bleeding", "🔴 نازف")):
+            sub = [t for t in given_b if (t[0].get("f") or {}).get("regime") == st_]
+            if sub:
+                sec.append(f"• {lab}: {rstat(sub)}")
+        strong = [t for t in given_b if ((t[0].get("f") or {}).get("support") or {}).get("strength", 0) >= 4]
+        mid = [t for t in given_b if 0 < ((t[0].get("f") or {}).get("support") or {}).get("strength", 0) < 4]
+        if strong:
+            sec.append(f"• قوة دعم ≥4: {rstat(strong)}")
+        if mid:
+            sec.append(f"• قوة دعم 3: {rstat(mid)}")
+        sec.append("\nإن كان الظلّي أسوأ من المُرسَل فالربط بالدعم يعمل؛ وإن تساويا فالدعم لا يضيف شيئاً.")
+        msgs.append("\n".join(sec))
     wi = whatif_text(settled)
     if wi:
         msgs.append(wi)
@@ -2886,7 +3081,7 @@ async def run_all() -> None:
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     keepalive = asyncio.create_task(keepalive_loop(app.bot_data["http"]))
     watcher = asyncio.create_task(watch_loop(app))
-    log.info("SolAlpha Sniper v4.0 is running — signal channel: @%s", SIGNAL_CHANNEL)
+    log.info("SolAlpha Sniper v4.1 is running — signal channel: @%s", SIGNAL_CHANNEL)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
