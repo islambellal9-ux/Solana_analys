@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SolAlpha Sniper v4.3 — Telegram bot (Render Web Service)
+SolAlpha Sniper v4.4 — Telegram bot (Render Web Service)
 مصدر العملات: قناة الإشارات https://t.me/solhousesignal حصرياً.
 طريقة القراءة (بالترتيب): 0) الوضع اليدوي: ترسل للبوت عقوداً أو تحوّل (Forward) رسائل الإشارات فيحللها /best (لا يحتاج أي إعداد)
                           1) Telethon بجلسة مستخدم (TELETHON_SESSION) — الأوثق
@@ -1603,6 +1603,7 @@ WELCOME = (
 )
 
 HELP = (
+    "📤 <b>/export</b>: ملف شموع الدقيقة والإشارات لمعايرة كاشف الارتداد على كل عملاتك (أرسله لي).\n\n"
     "📍 <b>الدعم</b>: كل ارتداد مؤكد يُرسل لك كما هو، ويُوسم بقوة الدعم (✅ قوي / ⚠️ ضعيف) مع أقرب دعم تحته، وأنبّهك عند اقتراب السعر من دعم قوي. "
     "العملات لا تُحذف من القائمة تلقائياً إلا بانتهاء المدة (8 ساعات).\n\n"
     "👁 <b>المراقبة</b>: كل عملة آمنة (وكذلك الحديثة جداً، التي على Bonding Curve، الهابطة، أو التي صعدت كثيراً) تدخل قائمة المراقبة، "
@@ -1626,7 +1627,7 @@ HELP = (
 async def post_init(application: Application) -> None:
     application.bot_data["http"] = httpx.AsyncClient(
         timeout=httpx.Timeout(12.0),
-        headers={"User-Agent": "SolAlphaSniper/4.3", "Accept": "application/json"},
+        headers={"User-Agent": "SolAlphaSniper/4.4", "Accept": "application/json"},
         follow_redirects=True,
     )
     application.bot_data["scan_lock"] = asyncio.Lock()
@@ -1701,8 +1702,15 @@ WATCH_TTL_HOURS = _env_float("WATCH_TTL_HOURS", 8)
 WATCH_MAX_PER_USER = int(_env_float("WATCH_MAX_PER_USER", 30))
 WATCH_CANDLES_PER_CYCLE = int(_env_float("WATCH_CANDLES_PER_CYCLE", 6))
 WATCH_SEC_PER_CYCLE = int(_env_float("WATCH_SEC_PER_CYCLE", 4))
-BOUNCE_MIN_PCT = _env_float("BOUNCE_MIN_PCT", 4)          # أقل ارتداد من القاع لاعتباره بدأ
+BOUNCE_MIN_PCT = _env_float("BOUNCE_MIN_PCT", 3)          # أقل ارتداد من القاع لاعتباره بدأ (كان 4)
 BOUNCE_MAX_PCT = _env_float("BOUNCE_MAX_PCT", 25)         # أكثر منه = فات الدخول المبكر
+BOUNCE_MIN_RR1 = _env_float("BOUNCE_MIN_RR1", 0)          # بوابة عائد/مخاطرة (0 = معطّلة: نُوسم الضعيف ولا نمنعه)
+FAIL_STREAK = int(_env_float("FAIL_STREAK", 2))           # فشلان متتاليان → كتم عملة (0 = معطّل)
+FAIL_MUTE_MIN = _env_float("FAIL_MUTE_MIN", 90)
+SAME_ZONE_CD_MIN = _env_float("SAME_ZONE_CD_MIN", 45)     # بعد الفشل: لا تنبيه من نفس المنطقة
+SUPPORT_ALERT_MIN_MC = _env_float("SUPPORT_ALERT_MIN_MC", 20000)
+SUPPORT_ALERT_COOLDOWN_MIN = _env_float("SUPPORT_ALERT_COOLDOWN_MIN", 180)
+HIST_MAX = 1500                                           # شموع دقيقة محفوظة لكل عملة للتصدير
 BOUNCE_MIN_RETRACE = _env_float("BOUNCE_MIN_RETRACE", 0.382)
 BOUNCE_SL_BUFFER = 0.02
 WATCH_FILE = os.getenv("WATCH_FILE", "watchlist.json")
@@ -1846,6 +1854,9 @@ def detect_bounce(candles: list, m: dict):
     tp2 = trough + 0.618 * (peak - trough)
     if tp1 < price * 1.05:
         return None, "الهدف الأول قريب جداً من السعر"
+    rr1_ = (tp1 - price) / (price - sl)
+    if BOUNCE_MIN_RR1 > 0 and rr1_ < BOUNCE_MIN_RR1:
+        return None, f"إشارة متأخرة: عائد/مخاطرة {rr1_:.1f} < {BOUNCE_MIN_RR1:.1f}"
     recent = [c[5] for c in w[-3:]]
     prev = [c[5] for c in w[-13:-3]]
     vol_up = bool(prev) and sum(prev) > 0 and (sum(recent) / len(recent)) > 1.2 * (sum(prev) / len(prev))
@@ -1855,6 +1866,7 @@ def detect_bounce(candles: list, m: dict):
         "bounce": bounce, "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": peak,
         "risk_pct": risk_pct, "rr1": (tp1 - price) / (price - sl), "rr2": (tp2 - price) / (price - sl),
         "stars": stars, "vol_up": vol_up, "buy": m["buy_ratio5"], "at": time.time(),
+        "hi_ratio": price / max(c[2] for c in candles), "trough_ts": w[tr_i][0],
     }, None
 
 
@@ -1940,9 +1952,17 @@ def find_supports(candles: list, k: int = 3, min_sep: int = 6, launch: bool = Fa
         gl = level <= gmin * 1.03
         base = launch and idx[0] <= 8
         strength = min(distinct, 4) + int(vol_x >= 1.5) + int(gl) + int(base)
+        zl, zh = min(min(lows), level * 0.985), max(max(lows), level * 1.015)
+        rn = 24 if k == 3 else 60
+        reactions = 0
+        for p in cl:
+            nxt = cs[p[0] + 1: p[0] + 1 + rn]
+            if nxt and max(c[2] for c in nxt) >= level * 1.10:
+                reactions += 1
+        broken = any(c[4] < zl * 0.97 for c in cs[idx[0] + 1:])
         zones.append({
-            "level": level, "low": min(min(lows), level * 0.985), "high": max(max(lows), level * 1.015),
-            "touches": distinct, "strength": strength, "vol_x": round(vol_x, 1), "gl": gl, "base": base,
+            "level": level, "low": zl, "high": zh, "touches": distinct, "strength": strength,
+            "vol_x": round(vol_x, 1), "gl": gl, "base": base, "reactions": reactions, "broken": broken,
         })
     return sorted(zones, key=lambda z: -z["strength"])[:8]
 
@@ -2006,6 +2026,11 @@ def support_text(it: dict, m: dict, s: dict) -> str:
     if ns:
         drop = (ns["high"] / s["entry"] - 1) * 100
         lines.append(f"↘️ إن كُسر الوقف: أقرب دعم قوي تحته MC {_mc(it, m, ns['low'])}–{_mc(it, m, ns['high'])} ({drop:+.0f}% عن الدخول)")
+    if s.get("rr1") is not None and s["rr1"] < 1.2:
+        lines.append(f"⚠️ عائد/مخاطرة TP1 = {s['rr1']:.1f} (ضعيف: الإشارة متأخرة أو الوقف بعيد)")
+    hr = s.get("hi_ratio")
+    if hr is not None and hr < 0.5:
+        lines.append(f"📉 يبعد {(1 - hr) * 100:.0f}% عن قمة آخر 16 ساعة — ارتداد داخل هبوط عام")
     lines.append(f"🌡️ السوق: {REGIME_LABEL.get(s.get('regime', 'neutral'), '')}")
     return "\n".join(lines) + "\n\n"
 
@@ -2027,26 +2052,29 @@ def next_support_note(it: dict, s: dict) -> str:
 
 
 async def maybe_support_alert(app: Application, it: dict, m: dict, zones: list) -> None:
-    """تنبيه اقتراب السعر من دعم قوي (للتجهّز وانتظار تأكيد الارتداد بدل مطاردته)."""
+    """اقتراب من دعم قوي *مُثبت* (لمسات ارتدت ≥10% ولم يُكسر) في عملة غير منهارة وغير مكتومة."""
     price = m["price"]
+    now = time.time()
     if not SUPPORT_ALERTS or price <= 0 or not zones:
         return
-    near = [z for z in zones if z["strength"] >= SUPPORT_MIN_STRENGTH
+    if m["mcap"] < SUPPORT_ALERT_MIN_MC or now < it.get("mute_until", 0) or it.get("hi_ratio", 1.0) < 0.35:
+        return
+    if now - it.get("sup_alert_ts", 0) < SUPPORT_ALERT_COOLDOWN_MIN * 60:
+        return
+    near = [z for z in zones if z["strength"] >= SUPPORT_MIN_STRENGTH and z.get("reactions", 0) >= 2
+            and not z.get("broken", False)
             and z["low"] * (1 - SUPPORT_TOL_PCT / 100) <= price <= z["high"] * (1 + SUPPORT_NEAR_PCT / 100)]
     if not near:
         return
     z = max(near, key=lambda x: x["strength"])
-    key = f"{z['level']:.3g}"
-    now = time.time()
-    alerted = it.setdefault("sup_alerted", {})
-    if now - alerted.get(key, 0) < 5400:
-        return
-    alerted[key] = now
+    it["sup_alert_ts"] = now
     dist = (price / z["high"] - 1) * 100
     where = "داخل الدعم" if dist <= 0 else f"يبعد {dist:.1f}% فوقه"
     await notify(app, it, (
-        f"📍 <b>{html.escape(it['sym'])}</b> تقترب من دعم قوي (قوة {z['strength']}، {z['touches']} لمسات)\n"
+        f"📍 <b>{html.escape(it['sym'])}</b> تقترب من دعم مُثبت (قوة {z['strength']} • {z['touches']} لمسات • "
+        f"{z['reactions']} ارتدادات ≥10% • لم يُكسر)\n"
         f"الدعم: MC {_mc(it, m, z['low'])}–{_mc(it, m, z['high'])} • الآن {fmt_usd(m['mcap'])} ({where})\n"
+        f"📋 <code>{it['mint']}</code>\n"
         "أراقب ارتداداً مؤكداً منه وأنبّهك — لا تدخل قبل التأكيد."))
 
 
@@ -2058,6 +2086,43 @@ def api_line() -> str:
         if st:
             parts.append(f"{name} {st[0].replace('HTTP ', '')}" + ("" if st[0] == "HTTP 200" else " ⚠️"))
     return ("🌐 " + " • ".join(parts)) if parts else ""
+
+
+def store_hist(bd: dict, it: dict, candles: list) -> None:
+    if not candles:
+        return
+    h = bd.setdefault("hist", {})
+    cur = h.get(it["mint"])
+    d = {int(c[0]): c for c in (cur["c"] if cur else [])}
+    for c in candles:
+        d[int(c[0])] = c
+    ts = sorted(d)[-HIST_MAX:]
+    h[it["mint"]] = {"sym": it["sym"], "c": [list(d[t]) for t in ts]}
+
+
+async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """ملف بيانات كامل (شموع 1د مع الفوليوم + الإشارات + القائمة) لتحليل أعمق ومعايرة الكاشف."""
+    msg = update.effective_message
+    bd = context.application.bot_data
+    uid = update.effective_user.id
+    watch = [{k: v for k, v in it.items() if k != "px"} for it in (bd.get("watch") or {}).values() if it["uid"] == uid]
+    mints = {it["mint"] for it in watch}
+    track = [r for r in (bd.get("track") or {}).values() if r["uid"] == uid]
+    mints |= {r["mint"] for r in track}
+    hist = {m_: v for m_, v in (bd.get("hist") or {}).items() if m_ in mints}
+    payload = {"version": "4.4", "ts": time.time(), "regime": bd.get("regime"), "watch": watch,
+               "tracker": track, "hist": hist}
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    n = sum(len(v["c"]) for v in hist.values())
+    try:
+        await msg.reply_document(
+            document=io.BytesIO(data), filename=f"solalpha_export_{time.strftime('%Y%m%d_%H%M')}.json",
+            caption=f"📤 {len(hist)} عملة • {n} شمعة دقيقة • {len(track)} إشارة. أرسل لي الملف لنحلل كل الارتدادات ونعايرالكاشف.")
+    except Exception:
+        log.exception("export failed")
+        await msg.reply_text("❌ تعذر إرسال الملف. راجع Logs.")
+    if not hist:
+        await msg.reply_text("ℹ️ لا شموع محفوظة بعد: تُجمع مع كل فحص للمراقبة (انتظر بضع دقائق بعد إضافة العملات).")
 
 
 async def notify(app: Application, it: dict, text: str) -> None:
@@ -2080,12 +2145,20 @@ async def track_setup(app: Application, it: dict, m: dict) -> None:
     sym = html.escape(it["sym"])
     if p <= s["sl"]:
         it["setup"] = None
-        await notify(app, it, f"🛑 <b>{sym}</b>: ضُرب وقف الخسارة ({fmt_price(s['sl'])}). الإعداد فشل — أواصل المراقبة لقاع جديد." + next_support_note(it, s))
+        it["fails"] = it.get("fails", 0) + 1
+        it["sl_ts"], it["sl_trough"] = time.time(), s.get("trough", s["sl"])
+        extra = ""
+        if FAIL_STREAK > 0 and it["fails"] >= FAIL_STREAK:
+            it["mute_until"] = time.time() + FAIL_MUTE_MIN * 60
+            it["fails"] = 0
+            extra = f"\n🔇 فشلان متتاليان: كتمتُ إشارات ارتداد هذه العملة {FAIL_MUTE_MIN:.0f} دقيقة (غالباً في انهيار)."
+        await notify(app, it, f"🛑 <b>{sym}</b>: ضُرب وقف الخسارة ({fmt_price(s['sl'])}). الإعداد فشل — أواصل المراقبة لقاع جديد." + next_support_note(it, s) + extra)
     elif p >= s["tp2"]:
         it["setup"] = None
         await notify(app, it, f"🎯🎯 <b>{sym}</b>: تحقق TP2 ({fmt_price(s['tp2'])}). فكّر بجني الأرباح/تأمين الباقي.")
     elif p >= s["tp1"] and not s.get("hit1"):
         s["hit1"] = True
+        it["fails"] = 0
         await notify(app, it, f"🎯 <b>{sym}</b>: تحقق TP1 ({fmt_price(s['tp1'])}). فكّر بنقل الوقف إلى نقطة الدخول.")
 
 
@@ -2152,7 +2225,15 @@ async def watch_cycle(app: Application) -> None:
         log.exception("compute_regime failed")
         regime = {"state": "neutral", "wr": None, "breadth": None}
     bd["regime"] = regime
-    for it in sorted(store.values(), key=lambda x: x["candle_ts"]):
+    for it in store.values():                 # عملة "ساخنة": ارتفعت 1.5–15% عن أدنى سعر آخر 20 دقيقة → فحص أسرع
+        mm = metrics.get(it["mint"])
+        if mm and mm["price"] > 0 and not it.get("off"):
+            px = it.setdefault("px", [])
+            px.append([now, mm["price"]])
+            del px[:-30]
+            lows = [p for t, p in px if now - t <= 1200]
+            it["hot"] = bool(it.get("sec_ok")) and len(lows) >= 3 and 1.015 <= mm["price"] / min(lows) <= 1.15
+    for it in sorted(store.values(), key=lambda x: (0 if x.get("hot") else 1, x["candle_ts"])):
         if store.get(it["key"]) is not it or it.get("off"):
             continue
         m = metrics.get(it["mint"])
@@ -2181,6 +2262,12 @@ async def watch_cycle(app: Application) -> None:
         candle_budget -= 1
         it["candle_ts"] = time.time()
         candles = await fetch_candles(client, m["pair"], 1, 1000)     # طلب واحد كالسابق، بتاريخ أطول
+        try:
+            store_hist(bd, it, candles)
+            if candles:
+                it["hi_ratio"] = m["price"] / max(c[2] for c in candles)
+        except Exception:
+            log.exception("hist store failed")
         zones: list = []
         try:
             zones = find_supports_1m(candles, m.get("age_min"))
@@ -2190,8 +2277,16 @@ async def watch_cycle(app: Application) -> None:
             raise
         except Exception:
             log.exception("support analysis failed (alerts continue)")
-        setup, why = detect_bounce(candles, m)                       # كاشف الارتداد كما هو بلا أي تغيير
+        setup, why = detect_bounce(candles, m)
         it["why"] = why or ""
+        if time.time() < it.get("mute_until", 0):
+            it["why"] = f"🔇 مكتومة بعد فشلين متتاليين حتى {time.strftime('%H:%M', time.gmtime(it['mute_until']))} UTC"
+            await asyncio.sleep(0.5)
+            continue
+        if setup and it.get("sl_ts") and time.time() - it["sl_ts"] < SAME_ZONE_CD_MIN * 60 \
+                and setup["trough"] >= it.get("sl_trough", 0) * 0.97:
+            it["why"] = "نفس منطقة الفشل السابقة — لا إعادة تنبيه حتى قاع أدنى"
+            setup = None
         if setup and setup["key"] not in it["alerted"]:
             it["alerted"] = (it["alerted"] + [setup["key"]])[-10:]
             try:
@@ -2255,6 +2350,8 @@ async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     for it in items[:20]:
         if it.get("off"):
             st = "⛔ موقوفة التنبيه"
+        elif time.time() < it.get("mute_until", 0):
+            st = "🔇 مكتومة (فشلان متتاليان)"
         elif it.get("setup"):
             st = "🟢 إشارة ارتداد نشطة"
         elif it["sec_ok"] is None:
@@ -3156,6 +3253,7 @@ async def run_all() -> None:
     app.add_handler(CommandHandler("watchlist", watchlist_cmd))
     app.add_handler(CommandHandler("unwatch", unwatch_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
+    app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.COMMAND & (filters.TEXT | filters.CAPTION), on_user_message
     ))
@@ -3168,7 +3266,7 @@ async def run_all() -> None:
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     keepalive = asyncio.create_task(keepalive_loop(app.bot_data["http"]))
     watcher = asyncio.create_task(watch_loop(app))
-    log.info("SolAlpha Sniper v4.3 is running — signal channel: @%s", SIGNAL_CHANNEL)
+    log.info("SolAlpha Sniper v4.4 is running — signal channel: @%s", SIGNAL_CHANNEL)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
